@@ -1,0 +1,167 @@
+<script setup lang="ts">
+/**
+ * 应用外壳（v0.8 暖纸主题）：左侧一级导航 + 右侧内容区。
+ * 页签按需挂载；activeTab 放在 Pinia store，供跨页跳转与 ?tab= 深链接复用。
+ */
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import {
+  NAlert, NConfigProvider, NDialogProvider, NMessageProvider, NSpin,
+  dateZhCN, zhCN,
+} from 'naive-ui'
+import type { GlobalThemeOverrides } from 'naive-ui'
+import { storeToRefs } from 'pinia'
+import SideNav from '@/components/SideNav.vue'
+import SetupWizard from '@/components/SetupWizard.vue'
+import { api } from '@/api/client'
+import { useJumpStore } from '@/stores/jump'
+
+const SearchView = defineAsyncComponent(() => import('@/views/SearchView.vue'))
+const ProjectsView = defineAsyncComponent(() => import('@/views/ProjectsView.vue'))
+const WorklogsView = defineAsyncComponent(() => import('@/views/WorklogsView.vue'))
+const IncidentsView = defineAsyncComponent(() => import('@/views/IncidentsView.vue'))
+const LinksView = defineAsyncComponent(() => import('@/views/LinksView.vue'))
+const NotesView = defineAsyncComponent(() => import('@/views/NotesView.vue'))
+const CredentialsView = defineAsyncComponent(() => import('@/views/CredentialsView.vue'))
+const RootsView = defineAsyncComponent(() => import('@/views/RootsView.vue'))
+const PlaceholderView = defineAsyncComponent(() => import('@/views/PlaceholderView.vue'))
+
+const navItems = [
+  { key: 'search', label: '全局搜索', group: '知识' },
+  { key: 'notes', label: '记事本', group: '知识' },
+  { key: 'projects', label: '项目事项', group: '业务' },
+  { key: 'worklogs', label: '工作日志', group: '业务' },
+  { key: 'incidents', label: '运维记录', group: '业务' },
+  { key: 'links', label: '企微链接', group: '业务' },
+  { key: 'credentials', label: '凭据库', group: '系统' },
+  { key: 'roots', label: '索引目录', group: '系统' },
+]
+
+/**
+ * 配色取自参考站的关系模型，但按工具型密度做了明度校正：
+ * 深墨蓝 = 主操作，陶土橙 = 强调，雾蓝 = 信息/链接，绿色 = 成功。
+ */
+const themeOverrides: GlobalThemeOverrides = {
+  common: {
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif',
+    fontSize: '13px',
+    fontSizeSmall: '12px',
+    primaryColor: '#1f3040',
+    primaryColorHover: '#2c4052',
+    primaryColorPressed: '#16242f',
+    primaryColorSuppl: '#2c4052',
+    infoColor: '#3e6288',
+    infoColorHover: '#4a719b',
+    infoColorPressed: '#2e4d6c',
+    infoColorSuppl: '#3e6288',
+    successColor: '#4d7459',
+    successColorHover: '#5b8668',
+    successColorPressed: '#3f6349',
+    successColorSuppl: '#4d7459',
+    warningColor: '#b0512c',
+    warningColorHover: '#bf5a36',
+    warningColorPressed: '#a44524',
+    warningColorSuppl: '#b0512c',
+    errorColor: '#b03a2e',
+    errorColorHover: '#c04a3c',
+    errorColorPressed: '#94302a',
+    errorColorSuppl: '#b03a2e',
+    textColorBase: '#26231e',
+    textColor1: '#26231e',
+    textColor2: '#4a4438',
+    textColor3: '#6f675b',
+    borderColor: '#e5dbcd',
+    dividerColor: '#e5dbcd',
+    bodyColor: '#f8f4ec',
+    cardColor: '#fffdf9',
+    modalColor: '#fffdf9',
+    popoverColor: '#fffdf9',
+    tableColor: '#fffdf9',
+    tableHeaderColor: '#f1e9dc',
+    inputColor: '#fffdf9',
+    hoverColor: '#f1e9dc',
+    borderRadius: '6px',
+    borderRadiusSmall: '4px',
+  },
+}
+
+const jump = useJumpStore()
+const { activeTab } = storeToRefs(jump)
+const ready = ref(false)
+const error = ref('')
+const showSetup = ref(false)
+const current = computed<{ label: string; stage: string }>(() => ({
+  label: navItems.find(i => i.key === activeTab.value)?.label ?? '',
+  stage: '',
+}))
+
+function onGlobalKey(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault()
+    activeTab.value = 'search'
+    nextTick(() => {
+      // 异步组件首次挂载可能晚于本次事件，做一次延迟兜底
+      window.dispatchEvent(new Event('onlyone:focus-search'))
+      window.setTimeout(() => window.dispatchEvent(new Event('onlyone:focus-search')), 120)
+    })
+  }
+}
+
+onMounted(async () => {
+  window.addEventListener('keydown', onGlobalKey)
+  try {
+    const st = await api<{ ok: boolean; counts: { roots: number } }>('/api/meta/status')
+    ready.value = true
+    // 没有任何索引根目录且未跳过时才弹向导
+    showSetup.value = st.counts.roots === 0
+      && !localStorage.getItem('onlyone_setup_skipped')
+  } catch (e) {
+    error.value = String(e)
+  }
+})
+onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
+</script>
+
+<template>
+  <n-config-provider :locale="zhCN" :date-locale="dateZhCN" :theme-overrides="themeOverrides">
+    <n-message-provider>
+      <n-dialog-provider>
+        <div class="app">
+          <side-nav
+            :items="navItems" :active="activeTab" version="v0.8 · 暖纸主题"
+            @update:active="activeTab = $event"
+          />
+          <main class="content">
+            <n-alert v-if="error" type="error" title="后端未就绪">
+              {{ error }} —— 请确认 backend/run.py 已启动，或改用 npm run dev 的开发模式。
+            </n-alert>
+            <div v-else-if="!ready" class="center"><n-spin size="small" /> 正在连接本地服务…</div>
+            <template v-else>
+              <SearchView v-if="activeTab === 'search'" />
+              <NotesView v-else-if="activeTab === 'notes'" />
+              <ProjectsView v-else-if="activeTab === 'projects'" />
+              <WorklogsView v-else-if="activeTab === 'worklogs'" />
+              <IncidentsView v-else-if="activeTab === 'incidents'" />
+              <LinksView v-else-if="activeTab === 'links'" />
+              <CredentialsView v-else-if="activeTab === 'credentials'" />
+              <RootsView v-else-if="activeTab === 'roots'" />
+              <PlaceholderView v-else :title="current.label" :stage="current.stage" />
+            </template>
+          </main>
+          <setup-wizard v-model:show="showSetup" />
+        </div>
+      </n-dialog-provider>
+    </n-message-provider>
+  </n-config-provider>
+</template>
+
+<style scoped>
+.app { height: 100vh; display: flex; background: var(--paper); }
+.content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 24px 28px;
+}
+.center { display: flex; align-items: center; gap: 10px; padding: 40px; color: var(--ink-3); }
+</style>
