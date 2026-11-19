@@ -8,27 +8,29 @@
 * ``is_private=1`` 的页面**完全不建 entries 行**，因此不进 FTS、语义向量与全局搜索。
 * 自动保存带 ``revision`` 乐观锁；仅内容/标题/私密标志变化才同步索引，并 checkpoint
   减少 WAL 中的明文残留。
-* 图片落盘到 ``data/attachments/<note_id>/``，通过只读 API 访问，绝不进 FTS。
+* 图片落盘到 ``data/attachments/<note_id>/``，文件名取内容 SHA-256 前 32 位，
+  同页内重复图片自动去重；通过只读 API 访问，绝不进 FTS。
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import io
 import json
 import logging
 import re
 import shutil
-import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from . import entries, semantic
+from . import entries, mht_import, semantic
 from .db import DATA_DIR, DB_PATH, connect
 
 log = logging.getLogger("onlyone")
@@ -38,8 +40,21 @@ ATTACH_DIR = DATA_DIR / "attachments"
 BACKUP_DIR = DATA_DIR / "backups"
 MAX_INDEX_CHARS = 20_000          # 入 FTS / 语义向量的正文上限
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+PROJECT_BOOK = "项目笔记"        # 项目工作台新建页面时的默认笔记本
 SAFE_FILENAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|jpeg|gif|webp)$")
 BLOCK_TYPES = {"paragraph", "heading", "codeBlock", "blockquote", "listItem"}
+# 导出 HTML 是脱离应用的独立文件，无法引用前端 CSS 变量，这里内联等价的暖纸色值；
+# 只覆盖表格与基础排版，不做像素级复刻。
+EXPORT_STYLE = (
+    "body{font-family:system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;"
+    "line-height:1.75;color:#26231e;background:#fffdf9;max-width:900px;"
+    "margin:32px auto;padding:0 24px}"
+    "table{border-collapse:collapse;width:100%;margin:14px 0;table-layout:fixed}"
+    "th,td{border:1px solid #e5dbcd;padding:6px 10px;text-align:left;"
+    "vertical-align:top;word-break:break-word;font-size:14px}"
+    "th{background:#f1e9dc;font-weight:600}"
+    "img{max-width:100%}"
+)
 
 
 class NotebookIn(BaseModel):
@@ -56,6 +71,7 @@ class SectionIn(BaseModel):
 class NoteCreate(BaseModel):
     section_id: int
     title: str = "未命名页面"
+    project_id: int | None = None
 
 
 class NoteUpdate(BaseModel):
@@ -73,6 +89,17 @@ class MoveIn(BaseModel):
 class ImageIn(BaseModel):
     data: str
     name: str = "image.png"
+
+
+class MhtFileIn(BaseModel):
+    name: str
+    data: str                  # base64（与图片上传一致，避免引入 python-multipart）
+
+
+class MhtImportIn(BaseModel):
+    notebook_id: int | None = None
+    book_name: str = "SAP 笔记"
+    files: list[MhtFileIn]
 
 
 # ---------------------------------------------------------------- 内容转换
@@ -112,6 +139,103 @@ def _extract_text(content_json: str) -> str:
     return "".join(parts)
 
 
+def _int_attr(attrs: dict, name: str) -> int:
+    try:
+        return max(1, int((attrs or {}).get(name) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _table_grid(table: dict, cell_text: Callable[[dict], str]) -> list[list[str]]:
+    """把 ProseMirror table 节点摊成等宽的二维文本网格。
+
+    GFM 表格没有合并语义：``colspan`` 展开成空列、``rowspan`` 在后续行补空位，
+    保证每行列数一致，否则任何 Markdown 渲染器都会错位。HTML 导出不走这里，
+    由 ``_render_html_table`` 原样保留 colspan / rowspan。
+    """
+    rows = [r for r in (table.get("content") or []) if isinstance(r, dict)]
+    grid: list[list[str]] = []
+    taken: list[set[int]] = []          # taken[i] = 第 i 行被上方 rowspan 占住的列号
+    for index, row in enumerate(rows):
+        while len(taken) <= index:
+            taken.append(set())
+        line: list[str] = []
+        col = 0
+        for cell in row.get("content") or []:
+            if not isinstance(cell, dict):
+                continue
+            while col in taken[index]:
+                line.append("")
+                col += 1
+            attrs = cell.get("attrs") or {}
+            colspan = _int_attr(attrs, "colspan")
+            rowspan = _int_attr(attrs, "rowspan")
+            line.append(cell_text(cell))
+            line.extend([""] * (colspan - 1))
+            for span_row in range(index + 1, index + rowspan):
+                while len(taken) <= span_row:
+                    taken.append(set())
+                taken[span_row].update(range(col, col + colspan))
+            col += colspan
+        while col in taken[index]:       # 行尾仍被上方 rowspan 占住
+            line.append("")
+            col += 1
+        grid.append(line)
+    width = max((len(line) for line in grid), default=0)
+    for line in grid:
+        line.extend([""] * (width - len(line)))
+    return grid
+
+
+def _render_md_table(table: dict, cell_text: Callable[[dict], str]) -> str:
+    """输出 GFM 表格；首行固定当表头（Markdown 无法表达无表头表格）。"""
+    grid = _table_grid(table, cell_text)
+    if not grid or not grid[0]:
+        return ""
+    width = len(grid[0])
+    lines = ["| " + " | ".join(grid[0]) + " |",
+             "| " + " | ".join(["---"] * width) + " |"]
+    for row in grid[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n\n"
+
+
+def _render_html_table(table: dict, cell_html: Callable[[dict], str]) -> str:
+    rows = [r for r in (table.get("content") or []) if isinstance(r, dict)]
+    if not rows:
+        return ""
+
+    def row_html(row) -> str:
+        cells: list[str] = []
+        for cell in row.get("content") or []:
+            if not isinstance(cell, dict):
+                continue
+            attrs = cell.get("attrs") or {}
+            tag = "th" if cell.get("type") == "tableHeader" else "td"
+            span = ""
+            colspan = _int_attr(attrs, "colspan")
+            rowspan = _int_attr(attrs, "rowspan")
+            if colspan > 1:
+                span += ' colspan="%d"' % colspan
+            if rowspan > 1:
+                span += ' rowspan="%d"' % rowspan
+            cells.append("<%s%s>%s</%s>" % (tag, span, cell_html(cell), tag))
+        return "<tr>%s</tr>" % "".join(cells)
+
+    head = rows[0]
+    has_head = any(isinstance(c, dict) and c.get("type") == "tableHeader"
+                   for c in head.get("content") or [])
+    parts: list[str] = []
+    if has_head:
+        parts.append("<thead>%s</thead>" % row_html(head))
+        body = rows[1:]
+    else:
+        body = rows
+    if body:
+        parts.append("<tbody>%s</tbody>" % "".join(row_html(r) for r in body))
+    return "<table>%s</table>" % "".join(parts)
+
+
 def _to_markdown(title: str, content_json: str) -> str:
     def render(node) -> str:
         kind = node.get("type")
@@ -145,7 +269,22 @@ def _to_markdown(title: str, content_json: str) -> str:
             return "- " + inner.strip() + "\n"
         if kind == "bulletList":
             return inner + "\n"
+        if kind == "table":
+            return _render_md_table(node, cell_md)
         return inner
+
+    def cell_md(cell) -> str:
+        """单元格拍平成单行：段落直接取行内内容，去掉换行并转义管道符。"""
+        chunks: list[str] = []
+        for child in cell.get("content") or []:
+            if not isinstance(child, dict):
+                continue
+            if child.get("type") == "paragraph":
+                chunks.append("".join(render(x) for x in child.get("content") or []))
+            else:
+                chunks.append(render(child))
+        text = " ".join(c.strip() for c in chunks if c.strip())
+        return text.replace("|", "\\|").replace("\n", " ").strip()
 
     body = "".join(render(c) for c in _parse_doc(content_json).get("content") or [])
     return "# %s\n\n%s" % (title, body)
@@ -190,12 +329,26 @@ def _to_html(title: str, content_json: str) -> str:
             return "<pre><code>%s</code></pre>" % inner
         if kind == "blockquote":
             return "<blockquote>%s</blockquote>" % inner
+        if kind == "table":
+            return _render_html_table(node, cell_html)
         return inner
+
+    def cell_html(cell) -> str:
+        """单元格内段落去掉 <p> 包裹，避免默认边距把表格撑开。"""
+        chunks: list[str] = []
+        for child in cell.get("content") or []:
+            if not isinstance(child, dict):
+                continue
+            if child.get("type") == "paragraph":
+                chunks.append("".join(render(x) for x in child.get("content") or []))
+            else:
+                chunks.append(render(child))
+        return "".join(chunks)
 
     body = "".join(render(c) for c in _parse_doc(content_json).get("content") or [])
     return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-            "<title>%s</title></head><body><h1>%s</h1>%s</body></html>"
-            % (html.escape(title), html.escape(title), body))
+            "<title>%s</title><style>%s</style></head><body><h1>%s</h1>%s</body></html>"
+            % (html.escape(title), EXPORT_STYLE, html.escape(title), body))
 
 
 # ---------------------------------------------------------------- 统一条目同步
@@ -247,7 +400,7 @@ def tree():
             for section in sections:
                 section["notes"] = [dict(r) for r in conn.execute(
                     """SELECT id, section_id, title, sort_order, is_private, revision,
-                              updated_at, substr(content_text,1,120) AS excerpt
+                              project_id, updated_at, substr(content_text,1,120) AS excerpt
                        FROM notes WHERE section_id=? ORDER BY sort_order, id""",
                     (section["id"],))]
             book["sections"] = sections
@@ -424,6 +577,165 @@ def export_notes(scope: str = "page", id: int = 0, format: str = "md"):
         headers={"Content-Disposition": 'attachment; filename="%s.zip"' % label})
 
 
+# ---------------------------------------------------------------- OneNote 导入
+
+MAX_IMPORT_BYTES = 64 * 1024 * 1024       # 单个 .mht 上限
+MAX_IMPORT_FILES = 20
+
+
+def _ensure_notebook(conn, notebook_id: int | None, fallback_name: str) -> int:
+    if notebook_id is not None:
+        if conn.execute("SELECT 1 FROM notebooks WHERE id=?", (notebook_id,)).fetchone() is None:
+            raise HTTPException(404, "笔记本不存在")
+        return notebook_id
+    name = (fallback_name or "").strip() or "SAP 笔记"
+    row = conn.execute("SELECT id FROM notebooks WHERE name=? ORDER BY id LIMIT 1",
+                       (name,)).fetchone()
+    if row is not None:
+        return int(row["id"])
+    return conn.execute(
+        "INSERT INTO notebooks(name,sort_order) VALUES(?, "
+        "(SELECT COALESCE(MAX(sort_order),0)+1 FROM notebooks))", (name,)).lastrowid
+
+
+def _create_section_unique(conn, notebook_id: int, base_name: str) -> tuple[int, str]:
+    """同名分区已存在时加序号，避免重复导入把页面混进旧分区。"""
+    base = (base_name or "").strip() or "导入分区"
+    names = {r["name"] for r in conn.execute(
+        "SELECT name FROM sections WHERE notebook_id=?", (notebook_id,))}
+    name = base
+    index = 2
+    while name in names:
+        name = "%s (%d)" % (base, index)
+        index += 1
+    section_id = conn.execute(
+        "INSERT INTO sections(notebook_id,name,sort_order) VALUES(?,?, "
+        "(SELECT COALESCE(MAX(sort_order),0)+1 FROM sections WHERE notebook_id=?))",
+        (notebook_id, name, notebook_id)).lastrowid
+    return section_id, name
+
+
+def _materialize_images(note_id: int, doc: dict,
+                        images: dict[str, tuple[bytes, str]]
+                        ) -> tuple[dict, int, list[str]]:
+    """把 ``__mht__:xxx`` 占位换成真实附件 URL 并落盘；缺失/超限的图片摘掉。"""
+    folder = ATTACH_DIR / str(note_id)
+    uploaded = 0
+    missing: list[str] = []
+
+    def walk(node) -> None:
+        nonlocal uploaded
+        children = node.get("content")
+        if not isinstance(children, list):
+            return
+        kept: list = []
+        for child in children:
+            if isinstance(child, dict) and child.get("type") == "image":
+                src = str((child.get("attrs") or {}).get("src") or "")
+                if not src.startswith(mht_import.IMG_SCHEME):
+                    kept.append(child)
+                    continue
+                name = src[len(mht_import.IMG_SCHEME):]
+                item = images.get(name)
+                raw = item[0] if item else b""
+                ext = _image_ext(raw) if raw else None
+                if not raw or ext is None or len(raw) > MAX_IMAGE_BYTES:
+                    missing.append(name)
+                    continue
+                folder.mkdir(parents=True, exist_ok=True)
+                filename = "%s.%s" % (hashlib.sha256(raw).hexdigest()[:32], ext)
+                target = folder / filename
+                if not target.is_file():
+                    target.write_bytes(raw)
+                child["attrs"]["src"] = "/api/attachments/%d/%s" % (note_id, filename)
+                uploaded += 1
+                kept.append(child)
+                continue
+            if isinstance(child, dict):
+                walk(child)
+                # 图片被摘掉后段落空了就一并去掉
+                if child.get("type") == "paragraph" and not child.get("content"):
+                    continue
+            kept.append(child)
+        node["content"] = kept
+
+    walk(doc)
+    return doc, uploaded, missing
+
+
+@router.post("/api/notes/import-mht")
+def import_mht(body: MhtImportIn):
+    """把 OneNote 导出的 .mht 批量导入：一个文件 = 一个分区，一页 = 一个页面。
+
+    base64 传输（与图片上传一致，不引入 python-multipart）。逐页提交，单页失败
+    不影响已导入内容；同名分区自动加序号。
+    """
+    if not body.files:
+        raise HTTPException(400, "没有待导入的文件")
+    if len(body.files) > MAX_IMPORT_FILES:
+        raise HTTPException(400, "单次最多导入 %d 个文件" % MAX_IMPORT_FILES)
+
+    conn = connect()
+    sections: list[dict] = []
+    errors: list[dict] = []
+    missing: list[str] = []
+    total_pages = 0
+    total_images = 0
+    try:
+        notebook_id = _ensure_notebook(conn, body.notebook_id, body.book_name)
+        for item in body.files:
+            display = (Path(item.name or "").name or "未命名").strip() or "未命名"
+            stem = Path(display).stem or display
+            try:
+                raw = base64.b64decode(item.data, validate=True)
+            except Exception:                    # noqa: BLE001
+                errors.append({"file": display, "error": "base64 解码失败"})
+                continue
+            if not raw:
+                errors.append({"file": display, "error": "文件为空"})
+                continue
+            if len(raw) > MAX_IMPORT_BYTES:
+                errors.append({"file": display, "error": "超过 64 MB 上限"})
+                continue
+            try:
+                pages, images = mht_import.build_pages(raw)
+            except Exception as exc:             # noqa: BLE001
+                errors.append({"file": display, "error": "解析失败：%s" % exc})
+                continue
+            if not pages:
+                errors.append({"file": display, "error": "没有识别到页面"})
+                continue
+
+            section_id, section_name = _create_section_unique(conn, notebook_id, stem)
+            page_count = 0
+            first_note_id: int | None = None
+            for title, doc in pages:
+                note_id = conn.execute(
+                    "INSERT INTO notes(section_id,title) VALUES(?,?)",
+                    (section_id, title)).lastrowid
+                if first_note_id is None:
+                    first_note_id = int(note_id)
+                doc, uploaded, miss = _materialize_images(note_id, doc, images)
+                total_images += uploaded
+                missing.extend(miss)
+                content_json = json.dumps(doc, ensure_ascii=False)
+                text = _extract_text(content_json)
+                conn.execute("UPDATE notes SET content_json=?, content_text=? WHERE id=?",
+                             (content_json, text, note_id))
+                row = conn.execute("SELECT * FROM notes WHERE id=?", (note_id,)).fetchone()
+                _sync_note_entry(conn, row)
+                conn.commit()
+                page_count += 1
+            total_pages += page_count
+            sections.append({"id": section_id, "name": section_name,
+                             "pages": page_count, "first_note_id": first_note_id})
+        _checkpoint(conn)
+        return {"notebook_id": notebook_id, "sections": sections, "pages": total_pages,
+                "images": total_images, "missing": missing, "errors": errors}
+    finally:
+        conn.close()
+
+
 @router.post("/api/backup")
 def backup_database():
     """全库备份：checkpoint 后复制 db（含凭据密文与 FTS 明文，需自行妥善保管）。"""
@@ -450,12 +762,81 @@ def create_note(body: NoteCreate):
                             (body.section_id,)).fetchone():
             raise HTTPException(404, "分区不存在")
         nid = conn.execute(
-            "INSERT INTO notes(section_id,title) VALUES(?,?)",
-            (body.section_id, body.title.strip() or "未命名页面")).lastrowid
+            "INSERT INTO notes(section_id,title,project_id) VALUES(?,?,?)",
+            (body.section_id, body.title.strip() or "未命名页面",
+             body.project_id)).lastrowid
         row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
         _sync_note_entry(conn, row)
         conn.commit()
         return {"id": nid, "revision": 0}
+    finally:
+        conn.close()
+
+
+@router.get("/api/notes")
+def list_notes(project_id: int | None = None, include_private: bool = False):
+    """按项目列页面（项目工作台用）；私密页默认不出现——它同样不进任何聚合视图。"""
+    conn = connect()
+    try:
+        sql = """SELECT n.id, n.title, n.updated_at, n.is_private, n.project_id,
+                        substr(n.content_text,1,160) AS excerpt,
+                        s.name AS section_name, b.name AS notebook_name
+                 FROM notes n
+                 JOIN sections s ON s.id = n.section_id
+                 JOIN notebooks b ON b.id = s.notebook_id"""
+        where: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            where.append("n.project_id=?")
+            params.append(project_id)
+        if not include_private:
+            where.append("n.is_private=0")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY n.updated_at DESC, n.id DESC LIMIT 500"
+        return [dict(r) for r in conn.execute(sql, params)]
+    finally:
+        conn.close()
+
+
+class ProjectNoteIn(BaseModel):
+    title: str = "未命名页面"
+
+
+@router.post("/api/projects/{project_id}/notes")
+def create_project_note(project_id: int, body: ProjectNoteIn):
+    """从项目工作台新建页面：自动落到「项目笔记」笔记本下按项目名命名的分区。"""
+    conn = connect()
+    try:
+        proj = conn.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
+        if proj is None:
+            raise HTTPException(404, "项目不存在：%s" % project_id)
+        pname = str(proj["name"]).strip() or ("项目 %d" % project_id)
+        book = conn.execute("SELECT id FROM notebooks WHERE name=? ORDER BY id LIMIT 1",
+                            (PROJECT_BOOK,)).fetchone()
+        if book is None:
+            bid = conn.execute(
+                "INSERT INTO notebooks(name,sort_order) VALUES(?, "
+                "(SELECT COALESCE(MAX(sort_order),0)+1 FROM notebooks))",
+                (PROJECT_BOOK,)).lastrowid
+        else:
+            bid = int(book["id"])
+        sec = conn.execute("SELECT id FROM sections WHERE notebook_id=? AND name=?",
+                           (bid, pname)).fetchone()
+        if sec is None:
+            sid = conn.execute(
+                "INSERT INTO sections(notebook_id,name,sort_order) VALUES(?,?, "
+                "(SELECT COALESCE(MAX(sort_order),0)+1 FROM sections WHERE notebook_id=?))",
+                (bid, pname, bid)).lastrowid
+        else:
+            sid = int(sec["id"])
+        nid = conn.execute(
+            "INSERT INTO notes(section_id,title,project_id) VALUES(?,?,?)",
+            (sid, body.title.strip() or "未命名页面", project_id)).lastrowid
+        row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        _sync_note_entry(conn, row)
+        conn.commit()
+        return {"id": nid, "section_id": sid, "notebook_id": bid, "revision": 0}
     finally:
         conn.close()
 
@@ -573,7 +954,11 @@ def _image_ext(raw: bytes) -> str | None:
 
 @router.post("/api/notes/{note_id}/images")
 def upload_image(note_id: int, body: ImageIn):
-    """base64 上传（无需 python-multipart）；校验魔数，避免伪装脚本文件。"""
+    """base64 上传（无需 python-multipart）；校验魔数，避免伪装脚本文件。
+
+    文件名 = ``sha256(raw)[:32].<ext>``，命中既有文件即复用（页内去重），
+    返回 ``dedup`` 标明是否为复用。
+    """
     conn = connect()
     try:
         if not conn.execute("SELECT 1 FROM notes WHERE id=?", (note_id,)).fetchone():
@@ -592,12 +977,18 @@ def upload_image(note_id: int, body: ImageIn):
     ext = _image_ext(raw)
     if ext is None:
         raise HTTPException(400, "不支持的图片格式（仅 png/jpg/gif/webp）")
-    filename = "%s.%s" % (uuid.uuid4().hex, ext)
+    # 文件名即内容哈希（前 32 位 hex）——仍满足 SAFE_FILENAME 白名单，且天然幂等：
+    # 同一页面重复粘贴同一张图只落一份文件。去重范围刻意限定在 note_id 目录内，
+    # 因为删页会 rmtree 整个目录，跨页复用会让删 A 页时把 B 页的图一起删掉。
+    filename = "%s.%s" % (hashlib.sha256(raw).hexdigest()[:32], ext)
     folder = ATTACH_DIR / str(note_id)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / filename).write_bytes(raw)
+    target = folder / filename
+    dedup = target.is_file()
+    if not dedup:
+        target.write_bytes(raw)
     return {"url": "/api/attachments/%d/%s" % (note_id, filename),
-            "filename": filename, "size": len(raw)}
+            "filename": filename, "size": len(raw), "dedup": dedup}
 
 
 @router.get("/api/attachments/{note_id}/{filename}")

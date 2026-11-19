@@ -67,20 +67,27 @@ const themeOverrides: GlobalThemeOverrides = {
     errorColorSuppl: '#b03a2e',
     textColorBase: '#26231e',
     textColor1: '#26231e',
-    textColor2: '#4a4438',
+    textColor2: '#5c564c',
     textColor3: '#6f675b',
-    borderColor: '#e5dbcd',
-    dividerColor: '#e5dbcd',
-    bodyColor: '#f8f4ec',
+    borderColor: '#d9cbb5',
+    dividerColor: '#d9cbb5',
+    bodyColor: '#f4eee2',
     cardColor: '#fffdf9',
     modalColor: '#fffdf9',
     popoverColor: '#fffdf9',
     tableColor: '#fffdf9',
-    tableHeaderColor: '#f1e9dc',
+    tableHeaderColor: '#ece2d3',
     inputColor: '#fffdf9',
     hoverColor: '#f1e9dc',
     borderRadius: '6px',
     borderRadiusSmall: '4px',
+  },
+  // 二级页签沿用"位置类"语义：橙色指示条，不用墨蓝（墨蓝只留给实心主按钮）
+  Tabs: {
+    barColor: '#bf5a36',
+    tabTextColorActiveLine: '#a44524',
+    tabTextColorHoverLine: '#a44524',
+    tabFontWeightActive: '500',
   },
 }
 
@@ -156,6 +163,8 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
 
 <style scoped>
 .app { height: 100vh; display: flex; background: var(--paper); }
+/* 内容区铺满窗口：宽屏不设整体 max-width（否则最大化后两侧留白）。
+   阅读版心交给内容自己控制——记事本正文 720px 居中，表格与列表按容器自适应。 */
 .content {
   flex: 1;
   min-width: 0;

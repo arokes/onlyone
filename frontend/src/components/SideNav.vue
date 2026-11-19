@@ -49,10 +49,13 @@ const groups = computed(() => {
         <button
           v-for="it in g.items" :key="it.key" type="button"
           class="nav-item" :class="{ active: props.active === it.key }"
+          :aria-label="it.label" :title="it.label"
+          :aria-current="props.active === it.key ? 'page' : undefined"
           @click="emit('update:active', it.key)"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+               stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+               aria-hidden="true" focusable="false">
             <path v-for="(d, i) in ICONS[it.key] ?? []" :key="i" :d="d" />
           </svg>
           <span class="nav-label">{{ it.label }}</span>
@@ -104,10 +107,15 @@ const groups = computed(() => {
   cursor: pointer;
 }
 .nav-item:hover { background: var(--paper-2); color: var(--ink); }
+/* 位置类语义：只靠 2px 橙条 + 文字加深表达"你在哪"，不再铺底色（规范 §8.6） */
 .nav-item.active {
-  background: var(--accent-soft);
-  color: var(--accent-strong);
+  background: transparent;
+  color: var(--ink);
   font-weight: 500;
+}
+.nav-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .nav-item.active::before {
   content: '';
@@ -137,5 +145,23 @@ const groups = computed(() => {
   margin-right: 6px;
   border-radius: 50%;
   background: var(--success);
+}
+
+/* 1024–1279：收成 72px 图标栏。文字一没，图标必须自己居中（否则整体左偏 9px） */
+@media (max-width: 1279px) {
+  .sidebar { width: 72px; }
+  .brand { padding: 14px 0 8px; text-align: center; }
+  .brand-name { font-size: 0; }
+  .brand-name::first-letter { font-size: 15px; }
+  .brand-sub { display: none; }
+  .nav { padding: 2px 8px 8px; }
+  .nav-group { margin-top: 8px; }
+  .nav-group + .nav-group { border-top: 1px solid var(--line-soft); padding-top: 8px; }
+  .nav-group-label { display: none; }
+  .nav-item { justify-content: center; padding: 7px 0; }
+  .nav-item svg { width: 20px; height: 20px; }
+  .nav-label { display: none; }
+  .footer { align-items: center; padding: 10px 0 12px; }
+  .footer div { font-size: 0; }
 }
 </style>

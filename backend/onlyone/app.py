@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from collections import OrderedDict
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -26,6 +27,26 @@ from .search import plugin_candidates, search_entries, semantic_candidates
 log = logging.getLogger("onlyone")
 TOKEN_ENV = "ONLYONE_TOKEN"
 STATUS_PATH = "/api/meta/status"
+
+# 只读预览缓存：同名同大小同 mtime 命中即复用，文件改动后自动失效。
+# 大文档抽取实测 2 秒以上（20 张表、12 万单元格），而预览常被反复打开。
+# 只留 5 条，避免把多份大表常驻内存。
+_PREVIEW_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_PREVIEW_CACHE_MAX = 5
+
+
+def _preview_cache_get(key: tuple) -> dict | None:
+    hit = _PREVIEW_CACHE.get(key)
+    if hit is not None:
+        _PREVIEW_CACHE.move_to_end(key)
+    return hit
+
+
+def _preview_cache_put(key: tuple, payload: dict) -> None:
+    _PREVIEW_CACHE[key] = payload
+    _PREVIEW_CACHE.move_to_end(key)
+    while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX:
+        _PREVIEW_CACHE.popitem(last=False)
 
 
 class RootIn(BaseModel):
@@ -392,9 +413,66 @@ def create_app(token: str) -> FastAPI:
             raise HTTPException(500, "打开失败：%s" % exc) from exc
         return {"opened": str(p.resolve()), "reveal": body.reveal}
 
+    def _preview_target(entry_id: int):
+        """预览类接口共用的条目解析：返回 (行数据, 文件路径或 None)。
+
+        非文件条目（项目/日志/记事）返回 ``(data, None)``；
+        路径不在已登记索引根下时抛 403，避免越权读取任意磁盘文件。
+        """
+        conn = _conn()
+        try:
+            row = conn.execute(
+                """SELECT e.*, f.abs_path, f.ext, f.extract_status, f.extract_error,
+                          r.kind AS root_kind
+                   FROM entries e
+                   LEFT JOIN files f ON f.id = e.ref_id AND e.type='file'
+                   LEFT JOIN roots r ON r.id = f.root_id
+                   WHERE e.id=?""", (entry_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "条目不存在：%s" % entry_id)
+            data = dict(row)
+            if data["type"] != "file" or not data["abs_path"]:
+                return data, None
+            if not _in_roots(conn, data["abs_path"]):
+                raise HTTPException(403, "只能预览已登记索引根目录下的文件")
+            return data, Path(data["abs_path"])
+        finally:
+            conn.close()
+
+    @app.get("/api/preview/images")
+    def preview_images(entry_id: int):
+        """文档内嵌图片清单（只返回元数据，字节走 /api/preview/image 按需取）。"""
+        data, path = _preview_target(entry_id)
+        if path is None:
+            return {"count": 0, "items": []}
+        from .images import list_images
+
+        items = list_images(path)
+        return {"count": len(items), "items": [it.as_dict() for it in items]}
+
+    @app.get("/api/preview/image")
+    def preview_image(entry_id: int, i: int, thumb: int = 0):
+        """取第 ``i`` 张图（0 基）；``thumb=1`` 返回最长边 320 的缩略图。"""
+        data, path = _preview_target(entry_id)
+        if path is None:
+            raise HTTPException(404, "该条目不是文件，没有可预览的图片")
+        from .images import read_image
+
+        try:
+            body, mime = read_image(path, i, thumb=bool(thumb))
+        except IndexError as exc:
+            raise HTTPException(404, "图片不存在：%s" % i) from exc
+        except Exception as exc:  # noqa: BLE001 - 单张转码失败只影响这张图
+            log.debug("图片转码失败 %s #%s: %s", path, i, exc)
+            raise HTTPException(500, "图片无法预览：%s" % exc) from exc
+        return Response(
+            content=body, media_type=mime,
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+
     @app.get("/api/preview")
     def preview(entry_id: int):
-        """只读预览：返回抽取的正文与表格，不写回文件、不缓存副本。"""
+        """只读预览：返回正文、表格与图片清单，不写回文件、不缓存副本。"""
         conn = _conn()
         try:
             row = conn.execute(
@@ -416,24 +494,42 @@ def create_app(token: str) -> FastAPI:
 
         if data["type"] != "file":
             return {"title": data["title"], "text": body_text or data["summary"], "tables": [],
-                    "error": "", "source": data.get("tags") or "业务记录", "abs_path": None,
-                    "extract_status": "", "root_kind": None}
+                    "images": [], "error": "", "source": data.get("tags") or "业务记录",
+                    "abs_path": None, "extract_status": "", "root_kind": None}
         if not data["abs_path"] or not allowed:
             raise HTTPException(403, "只能预览已登记索引根目录下的文件")
 
         from .extractor import extract
+        from .images import list_images
 
-        result = extract(Path(data["abs_path"]))
-        return {
+        path = Path(data["abs_path"])
+        cache_key = None
+        try:
+            st = path.stat()
+            cache_key = (str(path), int(st.st_mtime_ns), st.st_size)
+            cached = _preview_cache_get(cache_key)
+            if cached is not None:
+                return cached
+        except OSError:
+            cache_key = None
+
+        # with_images：在正文/单元格图片位置插 [图 N]，N 与下面 images 的序号对齐。
+        # 扫描入库仍走默认 False，标记不会进全文索引。
+        result = extract(path, with_images=True)
+        payload = {
             "title": data["title"],
             "text": result.text,
             "tables": result.tables,
+            "images": [it.as_dict() for it in list_images(path)],
             "error": result.error or data["extract_error"] or "",
             "source": "爱数同步盘" if data["root_kind"] == "anyshare_sync" else "本地",
             "abs_path": data["abs_path"],
             "extract_status": data["extract_status"],
             "root_kind": data["root_kind"],
         }
+        if cache_key is not None:
+            _preview_cache_put(cache_key, payload)
+        return payload
 
     dist = PROJECT_ROOT / "frontend" / "dist"
     if dist.is_dir():

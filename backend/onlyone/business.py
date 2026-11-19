@@ -240,6 +240,111 @@ def delete_biz(kind: str, rid: int):
         conn.close()
 
 
+@router.get("/api/projects/{project_id}/workspace")
+def project_workspace(project_id: int, limit: int = 5):
+    """项目工作台：一次返回五类计数 + 各类最近 N 条（页签徽标与摘要共用一次请求）。
+
+    * 记事本只统计**非私密页**，与 ``/api/notes?project_id=`` 口径一致。
+    * 关联文件来自 ``entry_relations`` 的 ``relation='project'``（在搜索页手动关联）。
+    """
+    entity = ENTITIES["projects"]
+    conn = connect()
+    try:
+        project = _row(conn, entity, project_id)
+        if project is None:
+            raise HTTPException(404, "项目不存在：%s" % project_id)
+        limit = max(0, min(int(limit), 50))
+        counts = {
+            "links": conn.execute("SELECT COUNT(*) FROM links WHERE project_id=?",
+                                  (project_id,)).fetchone()[0],
+            "worklogs": conn.execute("SELECT COUNT(*) FROM worklogs WHERE project_id=?",
+                                     (project_id,)).fetchone()[0],
+            "incidents": conn.execute("SELECT COUNT(*) FROM incidents WHERE project_id=?",
+                                      (project_id,)).fetchone()[0],
+            "notes": conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE project_id=? AND is_private=0",
+                (project_id,)).fetchone()[0],
+        }
+        prow = conn.execute("SELECT id FROM entries WHERE type='project' AND ref_id=?",
+                            (project_id,)).fetchone()
+        pid = int(prow["id"]) if prow else 0
+        if pid:
+            counts["files"] = conn.execute(
+                """SELECT COUNT(*) FROM entry_relations r
+                   JOIN entries e ON e.id = CASE WHEN r.src_entry_id=? THEN r.dst_entry_id
+                                                 ELSE r.src_entry_id END
+                   WHERE (r.src_entry_id=? OR r.dst_entry_id=?)
+                     AND r.relation='project' AND e.type='file'""",
+                (pid, pid, pid)).fetchone()[0]
+        else:
+            counts["files"] = 0
+
+        previews: dict[str, list[dict]] = {k: [] for k in
+                                           ("links", "worklogs", "incidents", "notes", "files")}
+        if limit:
+            previews["links"] = [dict(r) for r in conn.execute(
+                """SELECT id, title, url, note FROM links WHERE project_id=?
+                   ORDER BY COALESCE(last_check_at,'') DESC, id DESC LIMIT ?""",
+                (project_id, limit))]
+            previews["worklogs"] = [dict(r) for r in conn.execute(
+                """SELECT id, log_date, content, minutes FROM worklogs WHERE project_id=?
+                   ORDER BY log_date DESC, id DESC LIMIT ?""",
+                (project_id, limit))]
+            previews["incidents"] = [dict(r) for r in conn.execute(
+                """SELECT id, occurred_at, system, symptom, status FROM incidents
+                   WHERE project_id=? ORDER BY occurred_at DESC, id DESC LIMIT ?""",
+                (project_id, limit))]
+            previews["notes"] = [dict(r) for r in conn.execute(
+                """SELECT id, title, updated_at, substr(content_text,1,120) AS excerpt
+                   FROM notes WHERE project_id=? AND is_private=0
+                   ORDER BY updated_at DESC, id DESC LIMIT ?""",
+                (project_id, limit))]
+            if pid:
+                previews["files"] = [dict(r) for r in conn.execute(
+                    """SELECT e.id AS entry_id, e.title, e.summary, f.abs_path, f.ext
+                       FROM entry_relations r
+                       JOIN entries e ON e.id = CASE WHEN r.src_entry_id=? THEN r.dst_entry_id
+                                                     ELSE r.src_entry_id END
+                       LEFT JOIN files f ON f.id = e.ref_id
+                       WHERE (r.src_entry_id=? OR r.dst_entry_id=?)
+                         AND r.relation='project' AND e.type='file'
+                       ORDER BY e.updated_at DESC, e.id DESC LIMIT ?""",
+                    (pid, pid, pid, limit))]
+
+        data = dict(project)
+        data["entry_id"] = pid or None
+        return {"project": data, "counts": counts, "previews": previews}
+    finally:
+        conn.close()
+
+
+@router.get("/api/projects/{project_id}/files")
+def project_files(project_id: int):
+    """项目关联文件（在搜索页点「关联到项目」形成的 relation='project' 关系）。"""
+    conn = connect()
+    try:
+        if _row(conn, ENTITIES["projects"], project_id) is None:
+            raise HTTPException(404, "项目不存在：%s" % project_id)
+        prow = conn.execute("SELECT id FROM entries WHERE type='project' AND ref_id=?",
+                            (project_id,)).fetchone()
+        if prow is None:
+            return []
+        pid = int(prow["id"])
+        return [dict(r) for r in conn.execute(
+            """SELECT e.id AS entry_id, e.title, e.summary, e.updated_at,
+                      f.abs_path, f.ext, f.size
+               FROM entry_relations r
+               JOIN entries e ON e.id = CASE WHEN r.src_entry_id=? THEN r.dst_entry_id
+                                             ELSE r.src_entry_id END
+               LEFT JOIN files f ON f.id = e.ref_id
+               WHERE (r.src_entry_id=? OR r.dst_entry_id=?)
+                 AND r.relation='project' AND e.type='file'
+               ORDER BY e.updated_at DESC, e.id DESC LIMIT 500""",
+            (pid, pid, pid))]
+    finally:
+        conn.close()
+
+
 @router.get("/api/relations")
 def list_relations(entry_id: int):
     conn = connect()

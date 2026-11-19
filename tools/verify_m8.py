@@ -173,7 +173,11 @@ def main() -> int:
         # ① 先连续采样进度：不掺写请求，避免采样窗口被锁等待吃掉
         samples: list[tuple[str, int, int]] = []
         last_st: dict = {}
-        for _ in range(60):
+        # 403 个文件里含 docx/pptx 抽取，实测整轮约 10s；原先固定 60×0.1s=6s 的窗口
+        # 会先于扫描结束而退出，导致后续断言拿到 scanning 状态、并在 rebuild 上吃到 409。
+        # 改成按截止时间轮询，断言本身不变。
+        deadline = time.time() + 180
+        while time.time() < deadline:
             last_st = http(base, "/api/scan/status")
             samples.append((last_st["phase"], last_st["done"], last_st["total"]))
             if last_st["phase"] in ("done", "error"):

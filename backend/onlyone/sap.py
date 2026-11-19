@@ -262,30 +262,46 @@ def list_systems() -> list[dict]:
         out.append({
             "key": key, "label": f"{base}（{svc['name']}）",
             "sid": svc["sid"], "client": svc["client"],
-            "name": svc["name"], "launch_name": svc["name"],
+            "name": svc["name"],
+            # 实际传给 sapshcut 的是系统标识；连接项名仅供参考展示
+            "launch_system": svc["sid"], "launch_name": svc["name"],
         })
     return out
 
 
-def resolve_launch_name(sap_conn: str) -> tuple[str, str, str]:
-    """把凭据绑定值翻译成 sapshcut 的 -system= 值，返回 (值, client, 来源)。"""
+def resolve_launch(sap_conn: str) -> dict:
+    """把凭据绑定值翻译成 sapshcut 需要的系统标识/客户端/语言。
+
+    **``-system=`` 必须是系统标识（SID，如 DS4/QS4），绝不能传连接项名（DS4-120ZH）。**
+    2026-11-18 15:32 的 ``sapshlib_*.trc`` 再次坐实：传连接项名时 sapshlib 打印
+    ``Getting Description according to System ID in SAP landscape file >DS4-120ZH<`` →
+    ``Error in LoadAll: code = 516, Not all system data are available``，
+    对应界面上那个「部分数据不可用」错误框（标题恰为 ``SAP GUI``，很容易被误判成
+    「已打开会话」的假成功）。传 ``DS4`` + ``-client=120`` 才是正确形态。
+
+    注意：传 SID 时若该用户已有同系统会话，SAP 会**复用**而不新开窗口（exit=0、
+    不写 trace），这不是失败——调用方应按「复用」处理，见 ``launch_connection``。
+    """
     conn = (sap_conn or "").strip()
     sid, _, client = conn.partition("|")
     sid, client = sid.strip(), client.strip()
     if not sid:
         raise HTTPException(400, "该凭据未绑定 SAP 系统")
     refs = [s for s in _services() if s["type"].lower() == "reference"]
-    # 1) 绑定值本身就是连接项名（后续可直接存 name）
+    # 1) 绑定值是连接项名（如 DS4-120ZH）→ 反查它的 systemid
     for svc in refs:
         if svc["name"].lower() == conn.lower():
-            return svc["name"], client or svc["client"], "连接项名"
-    # 2) 旧格式 SID|客户端 → 反查连接项名（A 的核心）
+            return {"sid": svc["sid"], "client": client or svc["client"],
+                    "language": svc["language"] or "ZH",
+                    "source": "连接项名 → 系统标识"}
+    # 2) 常规：SID|客户端 → 直接用 SID，客户端取自绑定值
     for svc in refs:
         if svc["sid"].lower() == sid.lower() and (not client or svc["client"] == client):
-            return svc["name"], client, "SID|客户端 → 连接项名"
-    # 3) 回退旧行为；B2 会把随之而来的静默失败暴露成明确错误
-    log.warning("SAP 连接项未匹配：key=%s，回退为 SID（可能无法打开窗口）", conn)
-    return sid, client, "未匹配，回退 SID"
+            return {"sid": svc["sid"], "client": client or svc["client"],
+                    "language": svc["language"] or "ZH", "source": "系统标识"}
+    # 3) Landscape 里没这个 SID：仍按 SID 传，由 GUI 的报错对话框暴露出来
+    log.warning("SAP 系统标识未在 Landscape 中匹配：key=%s", conn)
+    return {"sid": sid, "client": client, "language": "ZH", "source": "未匹配"}
 
 
 # ---------------------------------------------------------------- Win32 窗口
@@ -382,18 +398,71 @@ def bring_to_front(hwnd: int) -> bool:
         return False
 
 
-def _wait_new_session(before: set[int], timeout: float = 3.0) -> dict | None:
-    """B2：等待新的 SAP GUI 会话窗口；一闪而过的窗口不算成功。"""
+# A 档（不传 -pw）下，sapshcut 的成功标志是 SAP Logon 弹出的
+# 「SAP GUI 快捷方式 - 登录 (SID, 客户端, 语言, 事务)」对话框：用户名已填、密码待输。
+_LOGIN_TITLE_MARK = "SAP GUI 快捷方式 - 登录"
+# 参数不被接受时 GUI 改弹属性对话框（trace 对应 LoadAll code=516），
+# 二者与会话窗口同进程、同可见性，只能靠标题区分。
+_ERROR_DIALOG_TITLES = ("SAP 快捷方式属性", "系统条目属性")
+
+
+def _is_login_prompt(win: dict) -> bool:
+    """「SAP GUI 快捷方式 - 登录」框 = 启动成功、等待输入密码。
+
+    只认标题不认进程：SAP GUI 7.70 起是单进程架构，登录框与会话窗口都挂在
+    ``saplogon.exe`` 下；更老的版本才单独有 ``sapgui.exe``。
+    """
+    return _LOGIN_TITLE_MARK in (win.get("title") or "")
+
+
+def _is_error_dialog(win: dict) -> bool:
+    title = win.get("title") or ""
+    return any(mark in title for mark in _ERROR_DIALOG_TITLES)
+
+
+def _is_logon_window(win: dict) -> bool:
+    """SAP Logon 的主界面（连接列表），既不是会话窗口也不是登录框。"""
+    return ((win.get("title") or "").startswith("SAP Logon")
+            and win.get("proc") in ("saplogon.exe", "sapgui.exe"))
+
+
+def _is_session_window(win: dict) -> bool:
+    """已登录的 SAP 会话窗口（复用场景）；排除 Logon 主界面、登录框与报错框。
+
+    2026-11-18：原实现只认 ``sapgui.exe``，而单进程架构下会话窗口是
+    ``saplogon.exe``（标题如「更改物料 (初始屏幕)」），导致复用会话永远识别不到、
+    启动被判失败。改为按「不是主界面 / 不是登录框 / 不是报错框」反选。
+    """
+    if win.get("proc") not in ("saplogon.exe", "sapgui.exe"):
+        return False
+    title = (win.get("title") or "").strip()
+    if not title or title == "SAP GUI":
+        # 「SAP GUI」是加载中与错误占位的通用标题。传错 -system 时 sapshlib 会弹
+        # 「部分数据不可用」错误框，标题也是它——曾据此判成 verified=1 的假成功。
+        return False
+    if _is_error_dialog(win) or _is_logon_window(win) or _is_login_prompt(win):
+        return False
+    return True
+
+
+def _wait_sap_ready(before: set[int], timeout: float = 10.0):
+    """等待登录框（成功）或报错对话框（失败），返回 (登录框, 错误框)。
+
+    超时返回 (None, None)，由调用方区分「复用已有会话」与「彻底没打开」。
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        fresh = [w for w in sap_windows("sapgui.exe") if w["hwnd"] not in before]
-        if fresh:
-            time.sleep(0.6)  # 排除 sapshcut 拉起后立即退出的假成功
-            alive = [w for w in sap_windows("sapgui.exe")
-                     if w["hwnd"] == fresh[0]["hwnd"]]
-            return alive[0] if alive else None
-        time.sleep(0.2)
-    return None
+        for win in sap_windows():
+            if win["hwnd"] in before:
+                continue
+            if _is_error_dialog(win):
+                return None, win
+            if _is_login_prompt(win) or _is_session_window(win):
+                time.sleep(0.5)  # 排除一闪而过的假窗口
+                alive = [w for w in sap_windows() if w["hwnd"] == win["hwnd"]]
+                return (alive[0] if alive else None), None
+        time.sleep(0.25)
+    return None, None
 
 
 # ---------------------------------------------------------------- 启动
@@ -409,7 +478,7 @@ def _require_gui() -> Path:
 def launch_logon() -> dict:
     """启动 SAP Logon；已在运行时不再重复启动，直接把窗口置前。"""
     gui = _require_gui()
-    existing = sap_windows("saplogon.exe")
+    existing = [w for w in sap_windows() if _is_logon_window(w)]
     if existing:
         front = bring_to_front(existing[0]["hwnd"])
         log.info("SAP Logon 已在运行，窗口置前 result=%s dir=%s", front, gui)
@@ -422,7 +491,7 @@ def launch_logon() -> dict:
     deadline = time.monotonic() + 4.0
     win = None
     while time.monotonic() < deadline:
-        wins = sap_windows("saplogon.exe")
+        wins = [w for w in sap_windows() if _is_logon_window(w)]
         if wins:
             win = wins[0]
             break
@@ -443,47 +512,65 @@ def launch_connection(sap_conn: str, username: str) -> dict:
     shcut = gui / SAPSHCUT_EXE
     if not shcut.is_file():
         raise HTTPException(404, "未在 %s 找到 sapshcut.exe" % gui)
-    system_value, client, source = resolve_launch_name(sap_conn)
-    argv = [str(shcut), "-system=" + system_value]
+
+    plan = resolve_launch(sap_conn)
+    sid, client, language, source = (plan["sid"], plan["client"],
+                                     plan["language"], plan["source"])
+    # -system= 只认 SID（DS4）：传连接项名 DS4-120ZH 会让 sapshlib LoadAll 516，
+    # 弹出「部分数据不可用」错误框（标题恰为 SAP GUI，极易被误认为已打开会话）。
+    argv = [str(shcut), "-type=System", "-system=" + sid]
     if client.strip():
         argv.append("-client=" + client.strip())
     if (username or "").strip():
         argv.append("-user=" + username.strip())
-    argv.append("-language=ZH")
+    argv.append("-language=" + language)
 
-    before = {w["hwnd"] for w in sap_windows("sapgui.exe")}
+    before = {w["hwnd"] for w in sap_windows()}
     try:
         proc = subprocess.Popen(argv)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, "启动失败：%s" % exc) from exc
 
     common = {
-        "opened": sap_conn, "launch_name": system_value, "source": source,
+        "opened": sap_conn, "launch_name": sid, "client": client,
+        "source": source,
         "username_filled": bool((username or "").strip()),
         "password_filled": False, "gui_dir": str(gui),
     }
-    win = _wait_new_session(before)
-    if win:
-        front = bring_to_front(win["hwnd"])
-        log.info("已按绑定启动 SAP 连接 key=%s → -system=%s（%s）verified=1 front=%s",
-                 sap_conn, system_value, source, front)
+    ready, dialog = _wait_sap_ready(before)
+    if dialog is not None:
+        log.error("SAP GUI 拒绝启动参数 key=%s -system=%s client=%s 对话框=%r",
+                  sap_conn, sid, client, dialog["title"])
+        raise HTTPException(
+            502,
+            "SAP GUI 弹出了「%s」对话框，说明启动参数未被接受（-system=%s，客户端 %s）。"
+            "请确认 SAP Logon 中存在对应连接项，且客户端号有效。"
+            % (dialog["title"], sid, client or "未指定"))
+    if ready is not None:
+        front = bring_to_front(ready["hwnd"])
+        log.info("已按绑定启动 SAP 连接 key=%s → -system=%s -client=%s（%s）"
+                 "verified=1 front=%s 窗口=%r",
+                 sap_conn, sid, client, source, front, ready["title"])
         return {**common, "verified": True, "front": front, "detail": ""}
 
-    # 未检测到新窗口：区分「复用已有会话」与「彻底没打开」
-    current = sap_windows("sapgui.exe")
+    # 超时：区分「复用已有会话」与「彻底没打开」
     exit_code = proc.poll()
-    if current:
-        front = bring_to_front(current[0]["hwnd"])
-        detail = "未检测到新会话窗口，可能复用了已打开的 SAP 会话；已尝试把该窗口置前。"
+    existing = [w for w in sap_windows() if _is_session_window(w)]
+    if existing:
+        front = bring_to_front(existing[0]["hwnd"])
+        detail = ("SAP GUI 已有登录会话，已复用当前会话并置前，未新建连接。"
+                  "（本次启动参数 -system=%s，sapshcut 退出码 %s；"
+                  "若需新开会话，请在 SAP Logon 里手动打开对应连接项。）"
+                  % (sid, exit_code))
         log.warning("SAP 启动结果未验证 key=%s -system=%s exit=%s detail=%s",
-                    sap_conn, system_value, exit_code, detail)
+                    sap_conn, sid, exit_code, detail)
         return {**common, "verified": False, "front": front, "detail": detail}
 
-    log.error("SAP 启动未打开会话窗口 key=%s -system=%s source=%s exit=%s gui=%s",
-              sap_conn, system_value, source, exit_code, gui)
+    log.error("SAP 启动未出现登录窗口 key=%s -system=%s client=%s exit=%s gui=%s",
+              sap_conn, sid, client, exit_code, gui)
     raise HTTPException(
         502,
-        "SAP GUI 未打开会话窗口（sapshcut 退出码 %s）。当前启动项 -system=%s（%s）。"
-        "请确认 SAP Logon 中存在该连接项，或在「凭据库 → SAP 连接设置」里"
-        "检查安装目录与 Landscape 文件。" % (
-            exit_code if exit_code is not None else "运行中", system_value, source))
+        "SAP GUI 未出现登录窗口（sapshcut 退出码 %s）。当前启动项 -system=%s "
+        "-client=%s（%s）。请确认 SAP Logon 中存在该连接项 %s。" % (
+            exit_code if exit_code is not None else "运行中", sid,
+            client or "未指定", source, sid))

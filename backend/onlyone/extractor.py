@@ -21,20 +21,38 @@ WPS COM 关键实测（2026-11-06，本机 WPS 10.8.2.6837 / COM 12.0）：
 """
 from __future__ import annotations
 
+import io
 import logging
+import struct
 import tempfile
 import threading
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger("onlyone")
 
-MAX_TEXT_CHARS = 100_000
+MAX_TEXT_CHARS = 200_000
+# 200k 而非 100k：一个 docx 里可能嵌着 16 个工作表的 Excel（实测单文件正文 13.3 万字），
+# 100k 会把尾部工作表整段截掉，导致「明明有却搜不到」。11 个含内嵌对象的文件总计多占约 1MB。
 MAX_TABLE_ROWS = 2_000
 MAX_TABLE_COLS = 40
 MAX_TABLES = 20
 MAX_PDF_PAGES = 500
+
+# OOXML 命名空间：只为在预览里定位图片（a:blip / v:imagedata）而用
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_V = "urn:schemas-microsoft-com:vml"
+_W_T = "{%s}t" % _W
+_W_TAB = "{%s}tab" % _W
+_W_BR = "{%s}br" % _W
+_A_BLIP = "{%s}blip" % _A
+_R_EMBED = "{%s}embed" % _R
+_V_IMAGEDATA = "{%s}imagedata" % _V
+_R_ID = "{%s}id" % _R
 
 TEXT_EXTS = {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".ini", ".yaml", ".yml"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -114,20 +132,92 @@ def _clip(text: str) -> str:
     return (text or "").strip()[:MAX_TEXT_CHARS]
 
 
-def _from_docx(path: Path) -> ExtractResult:
-    from docx import Document
+def _docx_para_text(el, rel_map: dict[str, int]) -> str:
+    """按 XML 文档顺序取段落文本，并在图片出现的位置插入 ``[图 N]`` 标记。
 
-    doc = Document(str(path))
-    lines = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+    只在只读预览（``with_images=True``）时启用，扫描入库仍走 ``p.text``，
+    避免图片标记污染全文索引。
+    """
+    parts: list[str] = []
+    last: int | None = None
+    for node in el.iter():
+        tag = node.tag
+        if tag == _W_T:
+            parts.append(node.text or "")
+        elif tag == _W_TAB or tag == _W_BR:
+            parts.append(" ")
+        elif tag == _A_BLIP or tag == _V_IMAGEDATA:
+            rid = node.get(_R_EMBED if tag == _A_BLIP else _R_ID)
+            idx = rel_map.get(rid) if rid else None
+            # mc:AlternateContent 的 Choice/Fallback 会重复指向同一张图，去重
+            if idx is not None and idx != last:
+                parts.append(" [图 %d] " % (idx + 1))
+                last = idx
+    return "".join(parts)
+
+
+def _docx_body(doc, rel_map: dict[str, int] | None = None
+               ) -> tuple[list[str], list[list[list[str]]]]:
+    """python-docx 文档对象 →（段落行, 表格）。不含内嵌对象。
+
+    ``rel_map`` 非空时在正文与表格单元格里插入 ``[图 N]`` 标记（只读预览用）。
+    """
+    if rel_map:
+        lines = [t for t in (x.strip() for x in
+                             (_docx_para_text(p._element, rel_map) for p in doc.paragraphs))
+                 if t]
+    else:
+        lines = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
     tables: list[list[list[str]]] = []
     for table in doc.tables[:MAX_TABLES]:
-        rows = [
-            [cell.text.strip().replace("\n", " ") for cell in row.cells[:MAX_TABLE_COLS]]
-            for row in table.rows[:MAX_TABLE_ROWS]
-        ]
+        rows: list[list[str]] = []
+        for row in table.rows[:MAX_TABLE_ROWS]:
+            cells: list[str] = []
+            for cell in row.cells[:MAX_TABLE_COLS]:
+                if rel_map:
+                    # 图片常在单元格里（截图贴在表格中），必须逐段落拼才拿得到标记
+                    text = " ".join(
+                        t for t in (x.strip() for x in
+                                    (_docx_para_text(p._element, rel_map)
+                                     for p in cell.paragraphs)) if t)
+                else:
+                    text = cell.text
+                cells.append(text.strip().replace("\n", " "))
+            rows.append(cells)
         if rows:
             tables.append(rows)
-    return ExtractResult(_clip("\n".join(lines)), tables)
+    return lines, tables
+
+
+def _from_docx(path: Path, with_images: bool = False) -> ExtractResult:
+    """正文 + 表格 + ``word/embeddings/`` 下的内嵌对象（Excel / Word）。
+
+    内嵌 Excel 在 Word 里有三种落盘形态，全部在这里处理：
+    ① 直接嵌入的 OOXML 部件（``Microsoft_Excel_Worksheet.xlsx``）；
+    ② OLE 复合包里的 ``package`` 流（OLE Package，内容仍是 xlsx/xls）；
+    ③ OLE 复合包里的 ``Workbook`` / ``Book`` 流（老式嵌入工作簿）。
+    内嵌位图（PBrush，即 Excel 截图）按用户决定不做 OCR，直接跳过——
+    只读预览改由 ``word/media/`` 里的预览图展示（Word 必存一张）。
+
+    ``with_images=True`` 时在正文/单元格图片位置插 ``[图 N]``（仅预览用，
+    扫描入库走默认值 False，标记不进全文索引）。
+    """
+    from docx import Document
+
+    rel_map: dict[str, int] | None = None
+    if with_images:
+        try:
+            from .images import docx_rel_map
+
+            rel_map = docx_rel_map(path) or None
+        except Exception as exc:  # noqa: BLE001 - 图片标记失败不该影响正文
+            log.debug("图片标记跳过 %s: %s", path, exc)
+
+    doc = Document(str(path))
+    lines, tables = _docx_body(doc, rel_map)
+    emb_lines, emb_tables = _docx_embeddings(path)
+    return ExtractResult(_clip("\n".join(lines + emb_lines)),
+                         (tables + emb_tables)[:MAX_TABLES])
 
 
 def _from_xlsx(path: Path) -> ExtractResult:
@@ -196,6 +286,188 @@ def _from_xls(path: Path) -> ExtractResult:
         if len(tables) >= MAX_TABLES:
             break
     return ExtractResult(_clip("\n".join(lines)), tables)
+
+
+# ------------------------------------------------------------ 内嵌对象（docx 里的 Excel）
+
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_ZIP_MAGIC = b"PK\x03\x04"
+MAX_EMBED_OBJECTS = 40                      # 单个 docx 最多处理的内嵌对象数
+MAX_EMBED_BYTES = 60 * 1024 * 1024          # 单个内嵌对象大小上限
+MAX_EMBED_DEPTH = 2                         # 内嵌文档再内嵌的递归层数
+
+
+def _xlsx_bytes_tables(data: bytes) -> tuple[list[str], list[list[list[str]]]]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    sheets: list[str] = []
+    tables: list[list[list[str]]] = []
+    try:
+        for ws in wb.worksheets:
+            sheets.append(ws.title)
+            rows: list[list[str]] = []
+            for idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if idx >= MAX_TABLE_ROWS:
+                    break
+                cells = ["" if v is None else str(v) for v in row[:MAX_TABLE_COLS]]
+                if any(c.strip() for c in cells):
+                    rows.append(cells)
+            if rows:
+                tables.append(rows)
+            if len(tables) >= MAX_TABLES:
+                break
+    finally:
+        wb.close()
+    return sheets, tables
+
+
+def _xls_bytes_tables(data: bytes) -> tuple[list[str], list[list[list[str]]]]:
+    import xlrd
+
+    book = xlrd.open_workbook(file_contents=data)
+    sheets: list[str] = []
+    tables: list[list[list[str]]] = []
+    for sheet in book.sheets():
+        sheets.append(sheet.name)
+        rows = [
+            [str(sheet.cell_value(r, c)) for c in range(min(sheet.ncols, MAX_TABLE_COLS))]
+            for r in range(min(sheet.nrows, MAX_TABLE_ROWS))
+        ]
+        rows = [row for row in rows if any(cell.strip() for cell in row)]
+        if rows:
+            tables.append(rows)
+        if len(tables) >= MAX_TABLES:
+            break
+    return sheets, tables
+
+
+def _read_cstr(buf: bytes, pos: int) -> tuple[str, int]:
+    end = buf.find(b"\x00", pos)
+    if end < 0 or end - pos > 512:
+        raise ValueError("no cstring")
+    raw = buf[pos:end]
+    try:
+        text = raw.decode("mbcs")
+    except Exception:  # noqa: BLE001 - 非 Windows 或非 ANSI 字符
+        text = raw.decode("latin-1", "replace")
+    return text, end + 1
+
+
+def _is_document(data: bytes) -> bool:
+    return data[:4] == _ZIP_MAGIC or data[:8] == _OLE_MAGIC
+
+
+def _ole10_payload(raw: bytes) -> tuple[str, bytes]:
+    """从 ``\\x01Ole10Native`` 流里取原始内嵌文件；解不出返回 ``("", b"")``。
+
+    变体 A 是 Word 标准打包（4B 总长 + 2B flags + label + 文件名 + 临时路径 + 4B 长度 + 数据）；
+    变体 B 是 4B 长度 + 裸数据（PBrush 截图与部分 WPS 产物如此），此时数据不是文档。
+    """
+    try:
+        pos = 6
+        _label, pos = _read_cstr(raw, pos)
+        name, pos = _read_cstr(raw, pos)
+        _tmp, pos = _read_cstr(raw, pos)
+        size = struct.unpack_from("<I", raw, pos)[0]
+        body = raw[pos + 4:pos + 4 + size]
+        if _is_document(body):
+            return name, body
+    except Exception:  # noqa: BLE001 - 落到变体 B
+        pass
+    if len(raw) >= 4:
+        size = struct.unpack_from("<I", raw, 0)[0]
+        body = raw[4:4 + size]
+        if _is_document(body):
+            return "", body
+    return "", b""
+
+
+def _zip_kind(data: bytes) -> str:
+    """识别 OOXML 压缩包类型：xlsx / docx / pptx / 其他空串。"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = set(z.namelist())
+    except Exception:  # noqa: BLE001
+        return ""
+    if "xl/workbook.xml" in names:
+        return "xlsx"
+    if "word/document.xml" in names:
+        return "docx"
+    if "ppt/presentation.xml" in names:
+        return "pptx"
+    return ""
+
+
+def _embedded_content(name: str, data: bytes,
+                      depth: int) -> tuple[list[str], list[list[list[str]]]]:
+    """把一个内嵌对象转成（说明行, 表格）；认不出的类型返回空，不报错。"""
+    if len(data) > MAX_EMBED_BYTES:
+        return ["内嵌对象 %s 超过 %dMB，已跳过"
+                % (name, MAX_EMBED_BYTES // 1024 // 1024)], []
+
+    kind = _zip_kind(data) if data[:4] == _ZIP_MAGIC else ""
+    if kind == "xlsx":
+        sheets, tables = _xlsx_bytes_tables(data)
+        return ["内嵌表格：%s（工作表：%s）" % (name, "、".join(sheets[:MAX_TABLES]))], tables
+    if kind == "docx" and depth < MAX_EMBED_DEPTH:
+        from docx import Document
+
+        sub_lines, sub_tables = _docx_body(Document(io.BytesIO(data)))
+        return ["内嵌文档：%s" % name] + sub_lines, sub_tables[:MAX_TABLES]
+    if kind:  # pptx 等其他 OOXML：不取内容也不报错
+        return [], []
+
+    if data[:8] == _OLE_MAGIC:
+        import olefile
+
+        try:
+            ole = olefile.OleFileIO(io.BytesIO(data))
+        except Exception:  # noqa: BLE001 - 结构损坏的 OLE 包
+            return [], []
+        try:
+            real = {"/".join(part).lower(): "/".join(part) for part in ole.listdir()}
+            # ① OLE Package：里面才是真正的原始文件
+            if "package" in real:
+                return _embedded_content(name, ole.openstream(real["package"]).read(), depth + 1)
+            # ② 老式嵌入工作簿（xls 的 Workbook/Book 流）
+            for wb_stream in ("workbook", "book"):
+                if wb_stream in real:
+                    sheets, tables = _xls_bytes_tables(ole.openstream(real[wb_stream]).read())
+                    return ["内嵌工作簿：%s（工作表：%s）"
+                            % (name, "、".join(sheets[:MAX_TABLES]))], tables
+            # ③ Ole10Native：优先标准包，其次长度前缀裸数据（位图会在这里被丢弃）
+            native = real.get("\x01olenative") or real.get("olenative")
+            if native:
+                _inner, payload = _ole10_payload(ole.openstream(native).read())
+                if payload:
+                    return _embedded_content(name, payload, depth + 1)
+        finally:
+            ole.close()
+    return [], []
+
+
+def _docx_embeddings(path) -> tuple[list[str], list[list[list[str]]]]:
+    """扫描 ``word/embeddings/`` 下的内嵌对象；单个对象失败只记 debug 日志。"""
+    lines: list[str] = []
+    tables: list[list[list[str]]] = []
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist()
+                     if n.startswith("word/embeddings/") and not n.endswith("/")]
+            for name in names[:MAX_EMBED_OBJECTS]:
+                short = name.rsplit("/", 1)[-1]
+                try:
+                    sub_lines, sub_tables = _embedded_content(short, z.read(name), 0)
+                    lines.extend(sub_lines)
+                    for table in sub_tables:
+                        if len(tables) < MAX_TABLES:
+                            tables.append(table)
+                except Exception as exc:  # noqa: BLE001 - 单个内嵌对象失败不影响正文
+                    log.debug("内嵌对象抽取失败 %s!%s: %s", path, name, exc)
+    except Exception as exc:  # noqa: BLE001 - 压缩包异常交给上层
+        log.debug("读取 docx 内嵌对象失败 %s: %s", path, exc)
+    return lines, tables
 
 
 def _from_pdf(path: Path) -> ExtractResult:
@@ -366,8 +638,12 @@ def _via_wps(src: Path, kind: str) -> ExtractResult:
         return result
 
 
-def extract(path: str | Path) -> ExtractResult:
-    """抽取单个文件；永不抛异常。未知后缀返回空正文（由扫描器仅索引文件名）。"""
+def extract(path: str | Path, *, with_images: bool = False) -> ExtractResult:
+    """抽取单个文件；永不抛异常。未知后缀返回空正文（由扫描器仅索引文件名）。
+
+    ``with_images=True`` 仅供只读预览：会在正文与表格单元格的图片位置插入
+    ``[图 N]`` 标记，N 对应 ``images.list_images()`` 的序号加一。
+    """
     p = Path(path)
     ext = p.suffix.lower()
     try:
@@ -378,7 +654,7 @@ def extract(path: str | Path) -> ExtractResult:
         if ext in IMAGE_EXTS:
             return _from_image(p)
         if ext == ".docx":
-            return _from_docx(p)
+            return _from_docx(p, with_images)
         if ext == ".xlsx":
             return _from_xlsx(p)
         if ext == ".pptx":

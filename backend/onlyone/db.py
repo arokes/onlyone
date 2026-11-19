@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS notes (
   sort_order INTEGER NOT NULL DEFAULT 0,
   is_private INTEGER NOT NULL DEFAULT 0,
   revision INTEGER NOT NULL DEFAULT 0,
+  project_id INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
@@ -185,6 +186,12 @@ def init_db() -> None:
         if "sap_conn" not in cols:
             conn.execute("ALTER TABLE credentials "
                          "ADD COLUMN sap_conn TEXT NOT NULL DEFAULT ''")
+        # 记事本归属项目（项目工作台需要按项目聚合记事本页）；老库补列 + 补索引。
+        note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)")}
+        if note_cols and "project_id" not in note_cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN project_id INTEGER")
+            log.info("notes 表已补 project_id 列")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id)")
         conn.commit()
         log.info("db ready: %s", DB_PATH)
     finally:

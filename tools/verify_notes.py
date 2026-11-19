@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -31,7 +33,7 @@ DATA_DIR = Path(tempfile.mkdtemp(prefix="onlyone_m7_"))
 os.environ["ONLYONE_DATA_DIR"] = str(DATA_DIR)
 
 sys.path.insert(0, str(BACKEND))
-from onlyone.db import connect  # noqa: E402
+from onlyone.db import DATA_DIR, connect  # noqa: E402
 
 TOKEN = "m7-notes-token-20261106"
 PREFIX = "M7验证-"
@@ -193,6 +195,74 @@ def main() -> int:
             base, "/api/attachments/%d/..%%2F..%%2Fonlyone.db" % note["id"], "GET", None, 400)
             or expect_status(base, "/api/attachments/%d/not-a-file.png" % note["id"],
                              "GET", None, 400)))
+
+        # 5b) 内容哈希命名 + 页内去重（2026-11-16 粘贴图片增强）
+        raw_png = base64.b64decode(PNG_1PX)
+        digest = hashlib.sha256(raw_png).hexdigest()[:32]
+        image_again = http(base, f"/api/notes/{note['id']}/images", "POST",
+                           {"data": "data:image/png;base64," + PNG_1PX, "name": "px.png"})
+        results.append(check("同图重复上传命中去重",
+                             image_again["url"] == image["url"]
+                             and image["dedup"] is False and image_again["dedup"] is True))
+        results.append(check("文件名为 SHA-256 前 32 位且符合白名单",
+                             image["filename"] == digest + ".png"
+                             and re.fullmatch(r"[0-9a-f]{32}\.png", image["filename"]) is not None))
+        folder = DATA_DIR / "attachments" / str(note["id"])
+        files_before = sorted(p.name for p in folder.iterdir() if p.is_file())
+        results.append(check("重复上传不新增附件文件",
+                             files_before == [digest + ".png"], str(files_before)))
+        other_png = base64.b64encode(raw_png + b"x").decode()
+        image_other = http(base, f"/api/notes/{note['id']}/images", "POST",
+                           {"data": "data:image/png;base64," + other_png, "name": "px2.png"})
+        results.append(check("不同字节不误判为重复",
+                             image_other["url"] != image["url"]
+                             and image_other["dedup"] is False))
+
+        # 5c) 表格：合并单元格导出 + 单元格文字进索引（2026-11-18）
+        current = http(base, f"/api/notes/{note['id']}")
+
+        def _cell(text: str, cs: int = 1, rs: int = 1, header: bool = False) -> dict:
+            para: dict = {"type": "paragraph"}
+            if text:
+                para["content"] = [{"type": "text", "text": text}]
+            return {"type": "tableHeader" if header else "tableCell",
+                    "attrs": {"colspan": cs, "rowspan": rs, "colwidth": None},
+                    "content": [para]}
+
+        table_doc = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "灾备恢复手册 数据库备份流程 2026"}]},
+            {"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    _cell("单元", header=True), _cell("状态", header=True),
+                    _cell("备注", header=True)]},
+                {"type": "tableRow", "content": [
+                    _cell("主库", rs=2), _cell("已演练"), _cell("含|管道")]},
+                {"type": "tableRow", "content": [_cell("回滚中"), _cell("")]},
+            ]},
+        ]}
+        http(base, f"/api/notes/{note['id']}", "PUT",
+             {"content_json": json.dumps(table_doc, ensure_ascii=False),
+              "revision": current["revision"]})
+        st, md, _ = raw_get(base, f"/api/notes/export?scope=page&id={note['id']}&format=md")
+        md_text = md.decode("utf-8")
+        results.append(check("表格导出 Markdown（GFM + 管道转义 + 合并拍平）",
+                             st == 200
+                             and "| 单元 | 状态 | 备注 |" in md_text
+                             and "| --- | --- | --- |" in md_text
+                             and "含\\|管道" in md_text
+                             and "|  | 回滚中 |  |" in md_text, md_text.strip()[-120:]))
+        st, html_bytes, _ = raw_get(
+            base, f"/api/notes/export?scope=page&id={note['id']}&format=html")
+        html_text = html_bytes.decode("utf-8")
+        results.append(check("表格导出 HTML（thead + rowspan + 内联样式）",
+                             st == 200 and "<thead>" in html_text
+                             and 'rowspan="2"' in html_text
+                             and "border-collapse" in html_text))
+        hits = http(base, "/api/search?q=" + urllib.parse.quote("回滚中"))
+        results.append(check("表格单元格文字进入 FTS",
+                             any(i["type"] == "note" and i["ref_id"] == note["id"]
+                                 for i in hits["items"])))
 
         # 6) 导出 md / zip
         st, md, _ = raw_get(base, f"/api/notes/export?scope=page&id={note['id']}&format=md")

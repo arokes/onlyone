@@ -4,11 +4,12 @@
  * 表格 + 表单 + 删除确认 + 行多选 / 批量删除 / TSV 列复制。
  * 字段由 Field[] 配置驱动，避免四个页面重复实现。
  */
-import { computed, h, onMounted, reactive, ref } from 'vue'
+import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import { NButton, NDataTable, NModal, useDialog, useMessage } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import { api } from '@/api/client'
 import BizFieldInput from './BizFieldInput.vue'
+import EmptyState from './EmptyState.vue'
 import type { Field } from './biz-types'
 
 const props = defineProps<{
@@ -17,6 +18,10 @@ const props = defineProps<{
   fields: Field[]
   /** 是否追加「关联条目」操作（项目事项页用） */
   extra?: boolean
+  /** 限定并固定归属项目：列表按 project_id 过滤，新增时强制写入该值 */
+  projectId?: number | null
+  /** 空状态补充说明（不给则用通用文案） */
+  emptyDesc?: string
 }>()
 const emit = defineEmits<{ (e: 'extra', row: Record<string, any>): void }>()
 
@@ -34,6 +39,11 @@ const checkedRowKeys = ref<(string | number)[]>([])
 const projectOptions = computed(() =>
   projects.value.map(p => ({ label: String(p.name), value: p.id as number })),
 )
+
+/** 已固定归属项目时，归属列既不显示也不让选，避免误改到别的项目 */
+const fixedProject = computed(() => typeof props.projectId === 'number' && props.projectId > 0)
+const visibleFields = computed(() =>
+  fixedProject.value ? props.fields.filter(f => f.key !== 'project_id') : props.fields)
 
 /** 与后端 business._validate 对齐的必填规则：保存前本地即时提示，不等后端返回错误 */
 const REQUIRED: Record<string, { key: string; label: string }[]> = {
@@ -74,16 +84,20 @@ function blank(): Record<string, any> {
     else if (f.type === 'select' && f.options?.length) data[f.key] = f.options[0].value
     else data[f.key] = null
   }
+  if (fixedProject.value) data.project_id = props.projectId
   return data
 }
 
 async function load() {
   loading.value = true
   try {
-    rows.value = await api<Record<string, any>[]>('/api/biz/' + props.kind)
-    projects.value = props.kind === 'projects'
-      ? rows.value
-      : await api<Record<string, any>[]>('/api/biz/projects')
+    const suffix = fixedProject.value ? `?project_id=${props.projectId}` : ''
+    rows.value = await api<Record<string, any>[]>('/api/biz/' + props.kind + suffix)
+    if (props.kind === 'projects') {
+      projects.value = rows.value
+    } else if (!fixedProject.value) {
+      projects.value = await api<Record<string, any>[]>('/api/biz/projects')
+    }
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -91,6 +105,10 @@ async function load() {
   }
 }
 onMounted(load)
+watch(() => props.projectId, () => {
+  checkedRowKeys.value = []
+  load()
+})
 
 function openCreate() {
   editingId.value = null
@@ -117,6 +135,7 @@ async function save() {
   try {
     const data: Record<string, any> = {}
     for (const f of props.fields) data[f.key] = form[f.key] ?? null
+    if (fixedProject.value) data.project_id = props.projectId
     const path = '/api/biz/' + props.kind + (editingId.value ? '/' + editingId.value : '')
     await api(path, {
       method: editingId.value ? 'PUT' : 'POST',
@@ -189,7 +208,7 @@ function cellValue(row: Record<string, any>, f: Field): string {
 }
 
 function toTsv(list: Record<string, any>[]): string {
-  const cols = props.fields.filter(f => !f.hideInTable)
+  const cols = visibleFields.value.filter(f => !f.hideInTable)
   const lines = [cols.map(c => c.label).join('\t')]
   for (const row of list) {
     lines.push(cols
@@ -244,15 +263,46 @@ async function openLink(url: string) {
 function renderCell(f: Field, row: Record<string, any>) {
   const raw = row[f.key]
   if (f.type === 'url') {
-    return h('a', { class: 'cell-link', onClick: () => openLink(String(raw || '')) },
-             String(raw || '—'))
+    const url = String(raw || '')
+    if (!url) return '—'
+    return h('span', { class: 'cell-url' }, [
+      h('a', {
+        class: 'cell-link',
+        href: url,
+        title: url,
+        onClick: (e: MouseEvent) => { e.preventDefault(); openLink(url) },
+      }, url),
+      h('button', {
+        class: 'cell-copy',
+        type: 'button',
+        title: '复制链接',
+        'aria-label': '复制链接',
+        onClick: async (e: MouseEvent) => {
+          e.stopPropagation()
+          try {
+            await writeClipboard(url)
+            message.success('已复制链接')
+          } catch {
+            message.error('复制失败')
+          }
+        },
+      }, '复制'),
+    ])
   }
   return cellValue(row, f)
 }
 
+/** 分页：0 行时整条隐藏（避免"空表还挂着 1 2 >"），有数据时可选每页条数 */
+const paginationProps = computed(() => (rows.value.length ? {
+  pageSize: 10,
+  showSizePicker: true,
+  pageSizes: [10, 20, 50],
+  prefix: ({ itemCount }: { itemCount: number | undefined }) => `共 ${itemCount ?? 0} 条`,
+} : false))
+
 const columns = computed<DataTableColumns>(() => {
   const cols: DataTableColumns = [{ type: 'selection' }]
-  for (const f of props.fields.filter(x => !x.hideInTable)) {
+  for (const f of visibleFields.value.filter(x => !x.hideInTable)) {
     cols.push({
       title: f.label,
       key: f.key,
@@ -285,8 +335,8 @@ const columns = computed<DataTableColumns>(() => {
       <h3 class="section-title">{{ title }}</h3>
       <span class="count-chip">{{ rows.length }}</span>
       <div class="grow" />
-      <n-button size="small" @click="load">刷新</n-button>
-      <n-button size="small" :disabled="!checkedRowKeys.length" @click="copyRows">
+      <n-button size="small" quaternary @click="load">刷新</n-button>
+      <n-button size="small" quaternary :disabled="!checkedRowKeys.length" @click="copyRows">
         复制表格（TSV）
       </n-button>
       <n-button size="small" :disabled="!checkedRowKeys.length" type="error" quaternary
@@ -303,15 +353,26 @@ const columns = computed<DataTableColumns>(() => {
       :row-key="(row: any) => row.id"
       :columns="columns" :data="rows" :loading="loading"
       :bordered="false" size="small" :scroll-x="1020"
-      :pagination="{ pageSize: 10 }"
-    />
+      :pagination="paginationProps"
+    >
+      <template #empty>
+        <empty-state
+          v-if="!loading"
+          compact
+          :title="`还没有${title}`"
+          :desc="emptyDesc || '新建第一条后，它会自动进入全文索引，可在全局搜索里按关键词找到。'"
+          :action-text="`新增${title}`"
+          @action="openCreate"
+        />
+      </template>
+    </n-data-table>
   </div>
 
   <n-modal
     v-model:show="showModal" preset="card"
     :title="(editingId ? '编辑' : '新增') + title" style="width: 580px"
   >
-    <div v-for="f in fields" :key="f.key" class="form-row">
+    <div v-for="f in visibleFields" :key="f.key" class="form-row">
       <label class="form-label">
         {{ f.label }}<span v-if="isRequired(f.key)" class="req" title="必填">*</span>
       </label>
@@ -337,4 +398,13 @@ const columns = computed<DataTableColumns>(() => {
 .req { color: var(--danger); margin-left: 3px; }
 .form-row > :not(.form-label) { flex: 1; min-width: 0; }
 :deep(.cell-link) { color: var(--info-deep); cursor: pointer; text-decoration: underline; }
+:deep(.cell-link:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+:deep(.cell-url) { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+:deep(.cell-url .cell-link) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:deep(.cell-copy) {
+  flex: 0 0 auto; padding: 0 5px; font-family: inherit; font-size: 12px; line-height: 18px;
+  color: var(--ink-3); background: var(--paper-2); border: 1px solid transparent;
+  border-radius: var(--r-xs); cursor: pointer; opacity: 0;
+}
+:deep(.n-data-table-tr:hover .cell-copy), :deep(.cell-copy:focus-visible) { opacity: 1; }
 </style>

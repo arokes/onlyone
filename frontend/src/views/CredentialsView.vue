@@ -1,15 +1,16 @@
 <script setup lang="ts">
 /**
- * 凭据库（M4-2，2026-11-09 调整）：全字段默认明文、点击行单选高亮、
- * 编辑/删除等动作收拢到工具栏、复制后 30 秒清剪贴板。
+ * 凭据库（M4-2，2026-11-17 调整）：密码默认掩码、点按眼睛图标逐行显示；
+ * 账号 / 链接 / 备注仍明文，点击行单选高亮，动作收拢到工具栏、复制后 30 秒清剪贴板。
  * 存储层仍是 DPAPI 加密；明文只在本页内存与 API 响应中，不写日志、不进全文索引。
  */
 import { computed, h, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
-  NButton, NDataTable, NInput, NModal, NSelect, useDialog, useMessage,
+  NButton, NDataTable, NDropdown, NInput, NModal, NSelect, useDialog, useMessage,
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import { api } from '@/api/client'
+import EmptyState from '@/components/EmptyState.vue'
 
 interface Credential {
   id: number
@@ -69,7 +70,30 @@ const editingId = ref<number | null>(null)
 const form = reactive<Record<string, any>>({})
 const cleared = ref<string[]>([])
 const selectedId = ref<number | null>(null)
+/** 密码默认掩码；只记录「当前点开明文」的行，刷新/离开页签即失效 */
+const revealed = ref<number[]>([])
 let clearTimer: number | undefined
+
+function isRevealed(id: number) {
+  return revealed.value.includes(id)
+}
+
+function toggleReveal(id: number) {
+  revealed.value = isRevealed(id)
+    ? revealed.value.filter(x => x !== id)
+    : [...revealed.value, id]
+}
+
+const EYE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"'
+  + ' stroke-linecap="round" stroke-linejoin="round">'
+  + '<path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z"/>'
+  + '<path d="M12 9.4a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 0 0 0-5.2Z"/></svg>'
+const EYE_OFF_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"'
+  + ' stroke-linecap="round" stroke-linejoin="round">'
+  + '<path d="M4 4l16 16"/>'
+  + '<path d="M9.9 5.1A10.9 10.9 0 0 1 12 4.9c6.4 0 10 6 10 6a17 17 0 0 1-3.3 3.9"/>'
+  + '<path d="M6.3 7.4A16.5 16.5 0 0 0 2 10.9s3.6 6 10 6a10.9 10.9 0 0 0 4.1-.8"/>'
+  + '<path d="M9.9 10.2a2.6 2.6 0 0 0 3.6 3.6"/></svg>'
 
 const selectedRow = computed(() =>
   rows.value.find(r => r.id === selectedId.value) ?? null,
@@ -119,6 +143,8 @@ async function load() {
     ])
     rows.value = creds
     projects.value = projs
+    // 重新拉取后一律回到掩码状态，避免明文在页面上长时间停留
+    revealed.value = []
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -146,14 +172,30 @@ function openCreate() {
   showModal.value = true
 }
 
+/** 行级动作收进「更多」菜单：工具栏一屏最多 3 个次级按钮 + 1 个主按钮（规范 §8.7） */
+const rowMenu = [
+  { label: '复制账号', key: 'username' },
+  { label: '复制密码', key: 'password' },
+  { label: '编辑', key: 'edit' },
+]
+function onRowMenu(key: string) {
+  const row = selectedRow.value
+  if (!row) return
+  if (key === 'edit') { openEdit(row); return }
+  void copyField(row, key)
+}
+
 function openEdit(row: Credential) {
   editingId.value = row.id
   resetForm()
   form.title = row.title
   form.project_id = row.project_id
   form.sap_conn = row.sap_conn || ''
-  // 列表已返回全部明文，直接回填；清空字段仍用弹窗里的「清空」标记。
-  for (const f of ENC_FIELDS) form[f.key] = row[f.key as keyof Credential] ?? ''
+  // 账号/链接/备注直接回填；密码不回填明文，留空即「不修改」，
+  // 避免掩码被当成新密码提交，也避免明文长期停在弹窗里。
+  for (const f of ENC_FIELDS) {
+    form[f.key] = f.key === 'password' ? '' : (row[f.key as keyof Credential] ?? '')
+  }
   showModal.value = true
 }
 
@@ -226,25 +268,30 @@ async function openUrl(row: Credential) {
 }
 
 /** 按凭据绑定的系统启动：后端自动填用户名、不填密码；前端自动复制密码 */
+const sapOpening = ref(false)
 async function openSap() {
+  if (sapOpening.value) return
   const row = selectedRow.value
-  if (!row || !row.sap_conn) {
-    try {
+  sapOpening.value = true
+  try {
+    if (!row || !row.sap_conn) {
       const r = await api<SapLaunchResult>('/api/open-sap', { method: 'POST' })
       message.success(r.reused ? 'SAP Logon 已在运行，已把窗口置前' : '已启动 SAP Logon')
-    } catch (e) {
-      message.error(String(e))
+      return
     }
-    return
-  }
-  try {
+    // 先复制密码、再启动 SAP：后端成功后会 bring_to_front 把 SAP 窗口置前，
+    // 页面随即失焦，之后 navigator.clipboard.writeText 会被拒绝（WebView2 里会挂起），
+    // 导致「复制失败」弹窗且后续提示全部不执行。
+    const copied = await copyField(row, 'password', true)
     const r = await api<SapLaunchResult>(`/api/credentials/${row.id}/open-sap`, { method: 'POST' })
     if (r.verified) message.success(`已打开 ${r.launch_name || '绑定的 SAP 系统'}（自动填用户名）`)
     else message.warning(r.detail || '未能确认 SAP 会话窗口已打开，请检查任务栏')
-    await copyField(row, 'password', true)
-    message.info('密码已复制到剪贴板，30 秒后自动清空')
+    if (copied) message.info('密码已复制到剪贴板，30 秒后自动清空')
+    else message.warning('密码未能自动复制，请点上方「复制密码」后手动粘贴')
   } catch (e) {
     message.error(String(e))
+  } finally {
+    sapOpening.value = false
   }
 }
 
@@ -308,19 +355,36 @@ async function resetSapConfig() {
   await saveSapConfig()
 }
 
+/**
+ * 写剪贴板。
+ * Clipboard API 要求文档持有焦点：SAP 窗口被置前后页面失焦，writeText 会被拒绝，
+ * 在 WebView2 里甚至会一直挂起不 resolve。所以加超时兜底，并回退到 execCommand。
+ * 调用方仍应尽量在抢焦点之前（启动 SAP 之前）写入。
+ */
 async function writeClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
-    return
+    try {
+      await Promise.race([
+        navigator.clipboard.writeText(text),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('写入超时')), 1500)),
+      ])
+      return
+    } catch { /* 失焦 / 无权限 / 超时 → 走 execCommand */ }
   }
   const ta = document.createElement('textarea')
   ta.value = text
+  ta.setAttribute('readonly', '')
   ta.style.position = 'fixed'
-  ta.style.opacity = '0'
+  ta.style.left = '-9999px'
   document.body.appendChild(ta)
   ta.select()
-  document.execCommand('copy')
-  document.body.removeChild(ta)
+  let ok = false
+  try {
+    ok = document.execCommand('copy')
+  } finally {
+    document.body.removeChild(ta)
+  }
+  if (!ok) throw new Error('浏览器拒绝了剪贴板写入')
 }
 
 function scheduleClear(value: string) {
@@ -328,7 +392,11 @@ function scheduleClear(value: string) {
   clearTimer = window.setTimeout(async () => {
     try {
       if (navigator.clipboard?.readText) {
-        const current = await navigator.clipboard.readText()
+        const current = await Promise.race([
+          navigator.clipboard.readText(),
+          new Promise<string>((_, reject) =>
+            setTimeout(() => reject(new Error('读取超时')), 1000)),
+        ])
         if (current && current !== value) return  // 用户已复制别的内容，不误清
       }
       await writeClipboard('')
@@ -339,19 +407,21 @@ function scheduleClear(value: string) {
   }, 30000)
 }
 
-async function copyField(row: Credential, field: string, silent = false) {
+async function copyField(row: Credential, field: string, silent = false): Promise<boolean> {
   // 列表已返回明文，无需再走 reveal 接口
   const value = String(row[field as keyof Credential] ?? '')
   if (!value) {
     message.warning('该字段为空')
-    return
+    return false
   }
   try {
     await writeClipboard(value)
     if (!silent) message.success('已复制，30 秒后自动清空剪贴板')
     scheduleClear(value)
+    return true
   } catch (e) {
     message.error('复制失败：' + String(e))
+    return false
   }
 }
 
@@ -364,15 +434,37 @@ const columns = computed<DataTableColumns>(() => {
       title: f.label,
       key: f.key,
       width: f.key === 'username' ? 230 : 210,
-      // 复制动作统一收拢到工具栏，表格行内只展示内容
-      render: (row: any) => h('div', { class: 'cell' }, [
-        f.key === 'url' && row.url
-          ? h('a', {
-              class: 'cell-link', title: '点击用默认浏览器打开',
-              onClick: () => void openUrl(row),
-            }, row.url)
-          : h('span', { class: 'cell-value ellipsis' }, row[f.key] || '—'),
-      ]),
+      // 复制动作统一收拢到工具栏，表格行内只展示内容；
+      // 密码列默认掩码，点眼睛才在内存里展开（不落盘、不进日志）。
+      render: (row: any) => {
+        if (f.key === 'password') {
+          const value = String(row.password || '')
+          if (!value) return h('span', { class: 'cell-value' }, '—')
+          const shown = isRevealed(row.id)
+          return h('div', { class: 'cell' }, [
+            h('span', { class: 'cell-value ellipsis' }, shown ? value : '••••••••'),
+            h('button', {
+              class: 'eye-btn',
+              type: 'button',
+              title: shown ? '隐藏密码' : '显示密码',
+              'aria-label': shown ? '隐藏密码' : '显示密码',
+              innerHTML: shown ? EYE_OFF_SVG : EYE_SVG,
+              onClick: (e: MouseEvent) => {
+                e.stopPropagation()  // 不触发整行选中
+                toggleReveal(row.id)
+              },
+            }),
+          ])
+        }
+        return h('div', { class: 'cell' }, [
+          f.key === 'url' && row.url
+            ? h('a', {
+                class: 'cell-link', title: '点击用默认浏览器打开',
+                onClick: () => void openUrl(row),
+              }, row.url)
+            : h('span', { class: 'cell-value ellipsis' }, row[f.key] || '—'),
+        ])
+      },
     })
   }
   cols.push({
@@ -468,7 +560,8 @@ onUnmounted(() => {
       凭据使用 Windows DPAPI 加密，绑定当前 Windows 账户，无需主口令；数据库被拷到别的账户或机器无法解密，
       凭据不进全文索引。
       <br />
-      按使用需求，<b>账号 / 密码 / 链接 / 备注全部默认明文显示</b>（屏幕与截图可见）；
+      按使用需求，<b>账号 / 链接 / 备注默认明文显示</b>，<b>密码默认掩码</b>，
+      点该行密码列的眼睛图标才展开明文（离开页签或刷新即恢复掩码）；
       复制后 30 秒自动清空剪贴板，离开页签立即清空。
     </div>
   </div>
@@ -532,16 +625,12 @@ onUnmounted(() => {
       <h3 class="section-title">凭据库</h3>
       <span class="count-chip">{{ rows.length }}</span>
       <div class="grow" />
-      <n-button size="small" @click="load">刷新</n-button>
+      <n-button size="small" quaternary @click="load">刷新</n-button>
       <n-button size="small" :disabled="!selectedRow" @click="openUrl(selectedRow!)">打开链接</n-button>
-      <n-button size="small" @click="openSap">启动 SAP</n-button>
-      <n-button size="small" :disabled="!selectedRow" @click="copyField(selectedRow!, 'username')">
-        复制账号
-      </n-button>
-      <n-button size="small" :disabled="!selectedRow" @click="copyField(selectedRow!, 'password')">
-        复制密码
-      </n-button>
-      <n-button size="small" :disabled="!selectedRow" @click="openEdit(selectedRow!)">编辑</n-button>
+      <n-button size="small" :loading="sapOpening" @click="openSap">启动 SAP</n-button>
+      <n-dropdown :options="rowMenu" trigger="click" :disabled="!selectedRow" @select="onRowMenu">
+        <n-button size="small" :disabled="!selectedRow">更多 ▾</n-button>
+      </n-dropdown>
       <n-button size="small" quaternary type="error" :disabled="!selectedRow"
                 @click="remove(selectedRow!)">
         删除
@@ -555,8 +644,23 @@ onUnmounted(() => {
     <n-data-table
       :columns="columns" :data="rows" :loading="loading" :row-props="rowProps"
       :bordered="false" size="small" :scroll-x="1220"
-      :pagination="{ pageSize: 10 }"
-    />
+      :pagination="rows.length ? {
+        pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50],
+        prefix: ({ itemCount }: { itemCount: number | undefined }) => `共 ${itemCount ?? 0} 条`,
+      } : false"
+    >
+      <template #empty>
+        <empty-state
+          v-if="!loading"
+          compact
+          title="还没有存过凭据"
+          desc="密码用 Windows DPAPI 加密，只在本账户可解；不会写进日志、不进全文索引。"
+          action-text="新增凭据"
+          hint="也可以从加密文件恢复已有的凭据库"
+          @action="openCreate"
+        />
+      </template>
+    </n-data-table>
   </div>
 
   <n-modal
@@ -570,8 +674,12 @@ onUnmounted(() => {
     <div v-for="f in ENC_FIELDS" :key="f.key" class="form-row">
       <label class="form-label">{{ f.label }}</label>
       <n-input
-        v-model:value="form[f.key]" type="text"
-        :placeholder="editingId ? '清空请点右侧「清空」' : ''"
+        v-model:value="form[f.key]"
+        :type="f.key === 'password' ? 'password' : 'text'"
+        :show-password-on="f.key === 'password' ? 'click' : undefined"
+        :placeholder="f.key === 'password'
+          ? (editingId ? '留空 = 不修改密码' : '密码')
+          : (editingId ? '清空请点右侧「清空」' : '')"
       />
       <n-button
         v-if="editingId" size="tiny" quaternary
@@ -641,6 +749,14 @@ onUnmounted(() => {
 .form-row > :deep(.n-button) { flex: 0 0 auto; }
 :deep(.cell) { display: flex; align-items: center; gap: 4px; }
 :deep(.cell-value) { flex: 1; min-width: 0; font-size: 12px; }
+:deep(.eye-btn) {
+  flex: 0 0 auto; width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line); border-radius: 4px;
+  background: var(--info-soft); color: var(--info-deep); cursor: pointer;
+}
+:deep(.eye-btn:hover) { border-color: var(--info); color: var(--accent-strong); }
+:deep(.eye-btn svg) { width: 14px; height: 14px; }
 :deep(.cell-link) {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 12px; color: var(--info-deep); cursor: pointer; text-decoration: underline;
@@ -651,7 +767,7 @@ onUnmounted(() => {
 .sap-line > :deep(.n-input) { flex: 1; min-width: 0; }
 .sap-line > :deep(.n-button) { flex: 0 0 auto; }
 .sap-chip {
-  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  font-size: 12px; padding: 2px 8px; border-radius: 999px;
   border: 1px solid var(--line); color: var(--ink-3);
   max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }

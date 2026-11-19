@@ -400,6 +400,61 @@ def _job_main(root_id: int, force: bool) -> None:
         log.warning("后台扫描失败 root=%s: %s", root_id, exc)
     finally:
         conn.close()
+        # 先把自己从 _JOBS 摘掉再交给维护线程：``_JOBS`` 是否存活就是「该目录正在
+        # 扫描」的判定，扫描线程若挂着 VACUUM 多活几秒，紧随其后的 rebuild 会吃 409
+        # （verify_m8 实测踩到）。
+        with _JOB_LOCK:
+            if _JOBS.get(root_id) is threading.current_thread():
+                _JOBS.pop(root_id, None)
+        _spawn_maintenance()
+
+
+_COMPACT_THREAD: threading.Thread | None = None
+
+
+def _spawn_maintenance() -> None:
+    """扫描结束后另起守护线程做索引维护，不阻塞也不占用扫描任务槽位。"""
+    global _COMPACT_THREAD
+    with _JOB_LOCK:
+        if _COMPACT_THREAD is not None and _COMPACT_THREAD.is_alive():
+            return
+        if any(t.is_alive() for t in _JOBS.values()):
+            # 还有别的目录在扫，让最后结束的那个任务来触发，避免抢写锁
+            log.debug("其它目录仍在扫描，跳过本次索引维护")
+            return
+        thread = threading.Thread(target=_maintenance_main, daemon=True,
+                                  name="onlyone-compact")
+        _COMPACT_THREAD = thread
+        thread.start()
+
+
+def _maintenance_main() -> None:
+    """做一次「够脏才动」的索引维护（方案 A）。
+
+    刷新/重建条目是 ``DELETE`` + ``INSERT``，FTS5 只留 tombstone、库里留空闲页，
+    不维护的话库文件会按 3 倍膨胀（实测 309 MB 里 201 MB 是垃圾）。
+    门槛：空闲页 ≥16 MB 且距上次维护 ≥1 小时，见 maintenance.AUTO_*。
+    """
+    from .maintenance import auto_compact_if_needed
+
+    def _no_scan_running() -> bool:
+        return not any(t.is_alive() for t in _JOBS.values())
+
+    try:
+        res = auto_compact_if_needed(guard=_no_scan_running)
+    except Exception as exc:  # noqa: BLE001 - 维护失败不得影响扫描结果
+        log.debug("索引维护跳过：%s", exc)
+        return
+    if res and res.get("ok"):
+        if res.get("vacuumed"):
+            log.info("扫描后已压缩索引库：%.1f MB → %.1f MB（耗时 %.1fs）",
+                     res["before"]["file_mb"], res["after"]["file_mb"],
+                     res.get("cost_sec", 0))
+        else:
+            log.info("扫描后已合并索引段，VACUUM 留待下次：%s", res.get("reason", ""))
+    elif res and res.get("reason"):
+        log.info("索引维护未完成，可退出应用后跑 tools/db_maintenance.py：%s",
+                 res["reason"])
 
 
 # ---------------------------------------------------------------- A / B 增量扫描

@@ -17,3 +17,4 @@ data/ocr_templates.npz
 Thumbs.db
 .vscode/
 .idea/
+/docs/screenshots

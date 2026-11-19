@@ -9,8 +9,9 @@ import {
   NAlert, NButton, NDrawer, NDrawerContent, NInput, NModal, NSelect,
   NSpin, NTooltip, useMessage,
 } from 'naive-ui'
-import { api } from '@/api/client'
+import { api, TOKEN } from '@/api/client'
 import { useJumpStore } from '@/stores/jump'
+import EmptyState from '@/components/EmptyState.vue'
 import { useSearchStore, type SearchItem } from '@/stores/search'
 
 type Item = SearchItem
@@ -18,11 +19,23 @@ interface Preview {
   title: string
   text: string
   tables: string[][][]
+  images?: ImageMeta[]
   error: string
   source: string
   abs_path: string | null
   extract_status: string | null
 }
+/** 文档内嵌图片的元数据；index 与正文 [图 N] 的 N-1 对应 */
+interface ImageMeta {
+  index: number
+  name: string
+  kind: 'native' | 'vector'
+  width: number
+  height: number
+  bytes: number
+}
+/** 正文片段：文字或图片锚点（img 为 0 基序号；block 表示该锚点独占一行） */
+interface Seg { text?: string; img?: number; block?: boolean }
 interface Project { id: number; name: string; entry_id: number | null }
 interface Group {
   key: string
@@ -65,6 +78,14 @@ const ICON_PATHS: Record<string, string[]> = {
 }
 
 const message = useMessage()
+/** 抽取状态用中文：界面上不出现裸的 ok / failed */
+const STATUS_LABEL: Record<string, string> = {
+  ok: '正常', failed: '失败', pending: '待抽取', skipped: '已跳过', empty: '无正文',
+}
+function statusLabel(value: string | null | undefined): string {
+  return value ? (STATUS_LABEL[value] ?? value) : '—'
+}
+
 const jump = useJumpStore()
 const search = useSearchStore()
 // 检索状态放在 store：页签切换会销毁本组件，状态不能留在组件内
@@ -74,6 +95,159 @@ const busy = ref(false)
 const showPreview = ref(false)
 const preview = ref<Preview | null>(null)
 const previewBusy = ref(false)
+
+/* —— 预览阅读体验 ——
+ * 抽屉宽度可拖拽 + 一键最大化；正文与表格都只渲染前若干行，
+ * 宽表可单独「放大查看」到全屏，避免 640px 里塞进十几万单元格。 */
+const DRAWER_DEFAULT_WIDTH = 760
+const TEXT_PREVIEW_LINES = 80
+const TABLE_PREVIEW_ROWS = 30
+const BIG_TABLE_STEP = 200
+
+const drawerWidth = ref(DRAWER_DEFAULT_WIDTH)
+const previewMax = ref(false)
+const viewportWidth = ref(window.innerWidth)
+const maxDrawerWidth = computed(() => Math.max(560, Math.round(viewportWidth.value * 0.96)))
+
+const textExpanded = ref(false)
+const expandedTables = ref<number[]>([])
+
+const showBigTable = ref(false)
+const bigTableIndex = ref(0)
+const bigRows = ref(BIG_TABLE_STEP)
+
+/** 预览结果按 entry 缓存在内存：同一文件二次打开不再走 2 秒抽取 */
+const previewCache = new Map<number, Preview>()
+const lastEntryId = ref<number | null>(null)
+
+const textLines = computed(() => (preview.value?.text ?? '').split('\n'))
+const shownText = computed(() =>
+  textExpanded.value ? textLines.value : textLines.value.slice(0, TEXT_PREVIEW_LINES),
+)
+const bigTable = computed<string[][]>(() => preview.value?.tables[bigTableIndex.value] ?? [])
+const bigBody = computed(() => bigTable.value.slice(1, bigRows.value + 1))
+
+/* —— 内嵌图片 ——
+ * 后端只发元数据，字节按需走 /api/preview/image（缩略图 320、原图 1600 封顶）。
+ * 正文里的 [图 N] 锚点按原位渲染成图：独占一行出块级大图，夹在文字中出行内小图；
+ * 底部网格降级为折叠区（默认收起），只在需要按序号翻阅时展开。 */
+const IMAGE_PREVIEW_MAX = 60
+const imgAll = ref(false)
+const imgOpen = ref(false)
+const showViewer = ref(false)
+const viewerIndex = ref(0)
+const viewerFit = ref(true)
+/** 加载失败的图退回「图 N」徽标，避免留白框 */
+const imgFailed = ref<Set<number>>(new Set())
+
+const allImages = computed<ImageMeta[]>(() => preview.value?.images ?? [])
+const shownImages = computed<ImageMeta[]>(() =>
+  imgAll.value ? allImages.value : allImages.value.slice(0, IMAGE_PREVIEW_MAX),
+)
+const viewerImage = computed<ImageMeta | null>(() => allImages.value[viewerIndex.value] ?? null)
+const imgByIndex = computed(() => new Map(allImages.value.map(m => [m.index, m])))
+
+function imgMeta(i: number): ImageMeta | undefined {
+  return imgByIndex.value.get(i)
+}
+
+function imgError(i: number) {
+  if (!imgFailed.value.has(i)) imgFailed.value.add(i)
+}
+
+function imgUrl(i: number, thumb: boolean) {
+  const base = `/api/preview/image?entry_id=${lastEntryId.value ?? 0}&i=${i}&thumb=${thumb ? 1 : 0}`
+  return TOKEN ? `${base}&token=${encodeURIComponent(TOKEN)}` : base
+}
+
+function openViewer(i: number) {
+  viewerIndex.value = i
+  viewerFit.value = true
+  showViewer.value = true
+}
+
+function stepViewer(delta: number) {
+  const n = allImages.value.length
+  if (!n) return
+  viewerIndex.value = (viewerIndex.value + delta + n) % n
+  viewerFit.value = true
+}
+
+const textSegments = computed<Seg[]>(() => segments(shownText.value.join('\n')))
+
+/**
+ * 把带 [图 N] 的文本切成「文字 / 图片锚点」片段。
+ * 锚点所在行去掉标记后只剩空白 → 判为块级（图片原本独占一段），否则按行内小图。
+ */
+function segments(text: string): Seg[] {
+  if (!text || !text.includes('[图 ')) return [{ text: text ?? '' }]
+  const out: Seg[] = []
+  const re = /\[图 (\d+)\]/g
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push({ text: text.slice(last, m.index) })
+    const lineStart = text.lastIndexOf('\n', m.index - 1) + 1
+    const nlAfter = text.indexOf('\n', m.index + m[0].length)
+    const lineEnd = nlAfter === -1 ? text.length : nlAfter
+    const block = text.slice(lineStart, m.index).trim() === ''
+      && text.slice(m.index + m[0].length, lineEnd).trim() === ''
+    out.push({ img: Number(m[1]) - 1, block })
+    last = m.index + m[0].length
+  }
+  if (last < text.length) out.push({ text: text.slice(last) })
+  return out
+}
+
+function onViewportResize() {
+  viewportWidth.value = window.innerWidth
+  if (previewMax.value) drawerWidth.value = maxDrawerWidth.value
+}
+
+function togglePreviewMax() {
+  previewMax.value = !previewMax.value
+  drawerWidth.value = previewMax.value ? maxDrawerWidth.value : DRAWER_DEFAULT_WIDTH
+}
+
+function isTableExpanded(i: number) {
+  return expandedTables.value.includes(i)
+}
+
+function toggleTable(i: number) {
+  expandedTables.value = isTableExpanded(i)
+    ? expandedTables.value.filter(x => x !== i)
+    : [...expandedTables.value, i]
+}
+
+/** 首行当表头；展开时不截断 */
+function tableBody(t: string[][], i: number) {
+  const rows = isTableExpanded(i) ? t : t.slice(0, TABLE_PREVIEW_ROWS + 1)
+  return rows.slice(1)
+}
+
+function maxCols(t: string[][] | undefined) {
+  return (t ?? []).reduce((n, row) => Math.max(n, row.length), 0)
+}
+
+function openBigTable(i: number) {
+  bigTableIndex.value = i
+  bigRows.value = BIG_TABLE_STEP
+  showBigTable.value = true
+}
+
+function loadMoreRows() {
+  bigRows.value += BIG_TABLE_STEP
+}
+
+async function copyTableTsv(t: string[][]) {
+  const tsv = t.map(row => row.join('\t')).join('\n')
+  try {
+    await navigator.clipboard.writeText(tsv)
+    message.success(`已复制 ${t.length} 行，可直接粘贴到 Excel`)
+  } catch (e) {
+    message.error('复制失败：' + String(e))
+  }
+}
 
 const showLink = ref(false)
 const linking = ref(false)
@@ -158,12 +332,40 @@ function openExternal(url: string | undefined) {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
 
+const PREVIEW_CACHE_MAX = 3
+
 async function openPreviewById(entryId: number) {
   showPreview.value = true
+  // 换条目时回到「折叠 + 默认宽度」，避免上一个文件的展开状态串到新文件
+  if (lastEntryId.value !== entryId) {
+    lastEntryId.value = entryId
+    textExpanded.value = false
+    expandedTables.value = []
+    imgAll.value = false
+    imgOpen.value = false
+    imgFailed.value = new Set()
+    if (previewMax.value) {
+      previewMax.value = false
+      drawerWidth.value = DRAWER_DEFAULT_WIDTH
+    }
+  }
+  const cached = previewCache.get(entryId)
+  if (cached) {
+    previewBusy.value = false
+    preview.value = cached
+    return
+  }
   previewBusy.value = true
   preview.value = null
   try {
-    preview.value = await api<Preview>('/api/preview?entry_id=' + entryId)
+    const data = await api<Preview>('/api/preview?entry_id=' + entryId)
+    preview.value = data
+    previewCache.set(entryId, data)
+    while (previewCache.size > PREVIEW_CACHE_MAX) {
+      const oldest = previewCache.keys().next().value
+      if (oldest === undefined) break
+      previewCache.delete(oldest)
+    }
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -279,9 +481,24 @@ watch(() => jump.pendingQuery, (val) => {
   }
 }, { immediate: true })
 
+/** 空状态主操作：搜过就清空回初始态，没搜过就带用户去建索引 */
+function onEmptyAction() {
+  if (searched.value) {
+    q.value = ''
+    items.value = []
+    semanticItems.value = []
+    pluginItems.value = []
+    searched.value = false
+    focusSearch()
+    return
+  }
+  jump.activeTab = 'roots'
+}
+
 onMounted(() => {
   window.addEventListener('keydown', onKey)
   window.addEventListener('onlyone:focus-search', focusSearch)
+  window.addEventListener('resize', onViewportResize)
   loadProjects()
   // 跨重启只留关键词：有词且本次会话尚未检索过时，自动重跑一次。
   // URL 深链接 ?q= 走 pendingQuery 的 immediate watch，会先把 searched 置真，避免重复请求。
@@ -290,6 +507,7 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('onlyone:focus-search', focusSearch)
+  window.removeEventListener('resize', onViewportResize)
 })
 </script>
 
@@ -311,9 +529,15 @@ onUnmounted(() => {
   </div>
 
   <div v-if="!allGroups.length" class="card" style="margin-top: 14px">
-    <div class="muted">
-      {{ searched ? '没有匹配结果。' : '先添加一个索引根目录并扫描，或录入项目 / 日志 / 运维 / 链接，然后在这里搜索。' }}
-    </div>
+    <empty-state
+      :title="searched ? `没找到与「${q.trim()}」匹配的内容` : '还没有可搜索的内容'"
+      :desc="searched
+        ? '试试更短的词或只保留关键词；两个字以内的短词会自动退回字面匹配，命中率更高。'
+        : '添加一个索引目录并扫描，或先录入项目 / 日志 / 运维记录，之后就能在这里统一搜索。'"
+      :action-text="searched ? '清空关键词' : '去添加索引目录'"
+      :hint="searched ? '或按 Ctrl+K 重新聚焦搜索框' : '扫描完成后结果会自动出现'"
+      @action="onEmptyAction"
+    />
   </div>
 
   <div v-for="g in allGroups" :key="g.key" class="card" style="margin-top: 14px">
@@ -409,25 +633,138 @@ onUnmounted(() => {
     </div>
   </div>
 
-  <n-drawer v-model:show="showPreview" :width="640" placement="right">
-    <n-drawer-content :title="preview?.title ?? '只读预览'" :native-scrollbar="false" closable>
+  <n-drawer
+    v-model:show="showPreview" v-model:width="drawerWidth" placement="right"
+    resizable :default-width="DRAWER_DEFAULT_WIDTH" :min-width="520" :max-width="maxDrawerWidth"
+  >
+    <n-drawer-content :native-scrollbar="false" closable>
+      <template #header>
+        <div class="pv-head">
+          <span class="pv-head-title" :title="preview?.title">
+            {{ preview?.title ?? '只读预览' }}
+          </span>
+          <n-button size="tiny" quaternary @click="togglePreviewMax">
+            {{ previewMax ? '还原宽度' : '最大化' }}
+          </n-button>
+        </div>
+      </template>
       <n-spin v-if="previewBusy" size="small" />
       <template v-else-if="preview">
         <div class="muted" style="margin-bottom: 10px">
-          来源：{{ preview.source }} · 抽取状态：{{ preview.extract_status || '—' }}
+          来源：{{ preview.source }} · 抽取状态：{{ statusLabel(preview.extract_status) }}
         </div>
         <n-alert v-if="preview.error" type="warning" style="margin-bottom: 12px">
           正文抽取失败：{{ preview.error }}
         </n-alert>
-        <pre class="pv-text">{{ preview.text || '（无正文）' }}</pre>
+
+        <template v-if="preview.text">
+          <div class="pv-text"><template v-for="(s, si) in textSegments" :key="si">
+            <span v-if="s.img === undefined">{{ s.text }}</span>
+            <figure v-else-if="s.block" class="pv-fig" :title="`打开第 ${s.img + 1} 张图`"
+                    @click="openViewer(s.img)">
+              <img v-if="!imgFailed.has(s.img)" :src="imgUrl(s.img, false)" loading="lazy"
+                   decoding="async" :alt="`图 ${s.img + 1}`" @error="imgError(s.img)" />
+              <button v-else class="pv-chip" @click.stop="openViewer(s.img)">
+                图 {{ s.img + 1 }}
+              </button>
+              <figcaption>
+                图 {{ s.img + 1 }}<template v-if="imgMeta(s.img)"> · {{ imgMeta(s.img)!.width }} ×
+                {{ imgMeta(s.img)!.height }}</template>
+              </figcaption>
+            </figure>
+            <template v-else>
+              <img v-if="!imgFailed.has(s.img)" class="pv-inline-img" :src="imgUrl(s.img, true)"
+                   loading="lazy" decoding="async" :alt="`图 ${s.img + 1}`"
+                   :title="`打开第 ${s.img + 1} 张图`"
+                   @click="openViewer(s.img)" @error="imgError(s.img)" />
+              <button v-else class="pv-chip" @click="openViewer(s.img)">图 {{ s.img + 1 }}</button>
+            </template>
+          </template></div>
+          <div v-if="textLines.length > TEXT_PREVIEW_LINES" class="pv-more">
+            <n-button size="tiny" quaternary @click="textExpanded = !textExpanded">
+              {{ textExpanded ? '收起正文' : `展开全文（共 ${textLines.length} 行）` }}
+            </n-button>
+          </div>
+        </template>
+        <div v-else class="muted">（无正文）</div>
+
         <div v-for="(t, ti) in preview.tables" :key="ti" class="pv-wrap">
-          <div class="muted" style="margin: 12px 0 6px">表格 {{ ti + 1 }}</div>
-          <table class="pv-table">
-            <tr v-for="(row, ri) in t" :key="ri">
-              <td v-for="(cell, ci) in row" :key="ci">{{ cell }}</td>
-            </tr>
-          </table>
+          <div class="pv-table-head">
+            <span class="muted">表格 {{ ti + 1 }} · {{ t.length }} 行 × {{ maxCols(t) }} 列</span>
+            <div class="grow" />
+            <n-button v-if="t.length > TABLE_PREVIEW_ROWS + 1" size="tiny" quaternary
+                      @click="toggleTable(ti)">
+              {{ isTableExpanded(ti) ? '收起' : `展开全部（${t.length} 行）` }}
+            </n-button>
+            <n-button size="tiny" quaternary @click="openBigTable(ti)">放大查看</n-button>
+            <n-button size="tiny" quaternary @click="copyTableTsv(t)">复制整表</n-button>
+          </div>
+          <div class="pv-table-scroll">
+            <table class="pv-table">
+              <thead>
+                <tr><td v-for="(cell, ci) in t[0]" :key="ci"><template
+                  v-for="(s, si) in segments(cell)" :key="si"
+                ><span v-if="s.img === undefined">{{ s.text }}</span><template v-else><img
+                  v-if="!imgFailed.has(s.img)" class="pv-cell-img" :src="imgUrl(s.img, true)"
+                  loading="lazy" decoding="async" :alt="`图 ${s.img + 1}`"
+                  @click="openViewer(s.img)" @error="imgError(s.img)"
+                /><button v-else class="pv-chip" @click="openViewer(s.img)"
+                >图 {{ s.img + 1 }}</button></template></template></td></tr>
+              </thead>
+              <tbody>
+                <tr v-for="(row, ri) in tableBody(t, ti)" :key="ri">
+                  <td v-for="(cell, ci) in row" :key="ci"><template
+                    v-for="(s, si) in segments(cell)" :key="si"
+                  ><span v-if="s.img === undefined">{{ s.text }}</span><template v-else><img
+                    v-if="!imgFailed.has(s.img)" class="pv-cell-img" :src="imgUrl(s.img, true)"
+                    loading="lazy" decoding="async" :alt="`图 ${s.img + 1}`"
+                    @click="openViewer(s.img)" @error="imgError(s.img)"
+                  /><button v-else class="pv-chip" @click="openViewer(s.img)"
+                  >图 {{ s.img + 1 }}</button></template></template></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="!isTableExpanded(ti) && t.length > TABLE_PREVIEW_ROWS + 1"
+               class="muted pv-hint">
+            仅渲染前 {{ TABLE_PREVIEW_ROWS }} 行，点「展开全部」或「放大查看」看余下内容
+          </div>
         </div>
+
+        <div v-if="allImages.length" class="pv-images">
+          <button class="pv-img-toggle" type="button" @click="imgOpen = !imgOpen">
+            <span class="pv-caret">{{ imgOpen ? '▾' : '▸' }}</span>
+            <span>全部图片 {{ allImages.length }} 张</span>
+            <span class="pv-img-toggle-hint">正文已按原位显示，展开可按序号翻阅</span>
+          </button>
+          <template v-if="imgOpen">
+            <div class="pv-table-head">
+              <span class="muted">缩略图</span>
+              <div class="grow" />
+              <n-button v-if="allImages.length > IMAGE_PREVIEW_MAX && !imgAll" size="tiny" quaternary
+                        @click="imgAll = true">
+                显示全部（{{ allImages.length }} 张）
+              </n-button>
+              <n-button v-else-if="imgAll && allImages.length > IMAGE_PREVIEW_MAX" size="tiny" quaternary
+                        @click="imgAll = false">
+                只看前 {{ IMAGE_PREVIEW_MAX }} 张
+              </n-button>
+            </div>
+            <div class="pv-grid">
+              <button v-for="im in shownImages" :key="im.index" class="pv-thumb"
+                      :title="`${im.name} · ${im.width}×${im.height}`"
+                      @click="openViewer(im.index)">
+                <img :src="imgUrl(im.index, true)" loading="lazy" :alt="`图 ${im.index + 1}`" />
+                <span class="pv-thumb-cap">图 {{ im.index + 1 }} · {{ im.width }}×{{ im.height }}</span>
+              </button>
+            </div>
+            <div v-if="!imgAll && allImages.length > IMAGE_PREVIEW_MAX" class="muted pv-hint">
+              仅渲染前 {{ IMAGE_PREVIEW_MAX }} 张缩略图，点「显示全部」看余下
+              {{ allImages.length - IMAGE_PREVIEW_MAX }} 张
+            </div>
+          </template>
+        </div>
+
         <div class="row" style="margin-top: 16px">
           <n-button v-if="preview.abs_path" size="small" secondary
                     @click="openByPath(preview.abs_path, false)">
@@ -442,6 +779,64 @@ onUnmounted(() => {
       <div v-else class="muted">没有可显示的内容。</div>
     </n-drawer-content>
   </n-drawer>
+
+  <n-modal
+    v-model:show="showBigTable" preset="card"
+    :title="`表格 ${bigTableIndex + 1} · ${bigTable.length} 行 × ${maxCols(bigTable)} 列`"
+    :style="{ width: '92vw', maxWidth: '1600px' }"
+  >
+    <div class="pv-big-scroll">
+      <table class="pv-table is-big">
+        <thead>
+          <tr><td v-for="(cell, ci) in (bigTable[0] ?? [])" :key="ci">{{ cell }}</td></tr>
+        </thead>
+        <tbody>
+          <tr v-for="(row, ri) in bigBody" :key="ri">
+            <td v-for="(cell, ci) in row" :key="ci">{{ cell }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <template #footer>
+      <div class="row" style="width: 100%; justify-content: flex-end; gap: 10px">
+        <span class="muted">
+          已显示 {{ Math.min(bigRows, Math.max(0, bigTable.length - 1)) }} /
+          {{ Math.max(0, bigTable.length - 1) }} 行
+        </span>
+        <n-button v-if="bigRows < bigTable.length - 1" size="small" @click="loadMoreRows">
+          再加载 {{ BIG_TABLE_STEP }} 行
+        </n-button>
+        <n-button size="small" @click="copyTableTsv(bigTable)">复制整表 TSV</n-button>
+      </div>
+    </template>
+  </n-modal>
+
+  <n-modal
+    v-model:show="showViewer" preset="card"
+    :title="viewerImage ? `图 ${viewerIndex + 1} / ${allImages.length}` : '图片'"
+    :style="{ width: '94vw', maxWidth: '1800px' }"
+  >
+    <div class="muted" style="margin-bottom: 8px">
+      {{ viewerImage?.name }} · {{ viewerImage?.width }}×{{ viewerImage?.height }}
+      <template v-if="viewerImage?.kind === 'vector'">· 矢量图（已栅格化）</template>
+    </div>
+    <div class="pv-viewer" :class="{ 'is-fit': viewerFit }">
+      <img v-if="viewerImage" :src="imgUrl(viewerIndex, false)" :alt="`图 ${viewerIndex + 1}`"
+           :title="viewerFit ? '点击查看原始尺寸' : '点击适应窗口'"
+           @click="viewerFit = !viewerFit" />
+    </div>
+    <template #footer>
+      <div class="row" style="width: 100%; gap: 10px">
+        <n-button size="small" :disabled="allImages.length < 2" @click="stepViewer(-1)">上一张</n-button>
+        <n-button size="small" :disabled="allImages.length < 2" @click="stepViewer(1)">下一张</n-button>
+        <div class="grow" />
+        <n-button size="small" quaternary @click="viewerFit = !viewerFit">
+          {{ viewerFit ? '原始尺寸' : '适应窗口' }}
+        </n-button>
+        <n-button size="small" quaternary @click="showViewer = false">关闭</n-button>
+      </div>
+    </template>
+  </n-modal>
 
   <n-modal v-model:show="showLink" preset="card" title="关联到项目" style="width: 420px">
     <div class="muted" style="margin-bottom: 10px">
@@ -467,7 +862,7 @@ onUnmounted(() => {
 }
 .result-bar .metric b { font-size: 14px; font-weight: 500; color: var(--ink); margin-right: 3px; }
 .result-bar .mode {
-  margin-left: auto; font-size: 11px; letter-spacing: 0.04em;
+  margin-left: auto; font-size: 12px; letter-spacing: 0.04em;
   color: var(--info-deep); background: var(--info-soft);
   border-radius: 4px; padding: 2px 7px;
 }
@@ -477,16 +872,16 @@ onUnmounted(() => {
 .hit:first-of-type { border-top: none; }
 .hit-head { display: flex; align-items: center; gap: 8px; }
 .hit-badge {
-  flex: 0 0 auto; font-size: 11px; line-height: 18px; padding: 0 7px;
+  flex: 0 0 auto; font-size: 12px; line-height: 18px; padding: 0 7px;
   border-radius: 4px; background: var(--paper-2); color: var(--ink-2);
 }
 .hit-badge.is-title { background: var(--info-soft); color: var(--info-deep); }
 .hit-title {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 14px; font-weight: 500; color: var(--ink);
-  background: var(--info-soft); border-radius: 4px; padding: 4px 9px;
+  background: transparent; padding: 4px 0;
 }
-.hit-source { flex: 0 0 auto; font-size: 11px; color: var(--ink-3); }
+.hit-source { flex: 0 0 auto; font-size: 12px; color: var(--ink-3); }
 .snippet-row { display: flex; align-items: flex-start; gap: 8px; margin-top: 7px; }
 .snippet {
   flex: 1; min-width: 0; border-left: 2px solid var(--line); padding-left: 10px;
@@ -495,20 +890,20 @@ onUnmounted(() => {
   overflow: hidden; word-break: break-word;
 }
 .snippet :deep(mark) { font-weight: 500; }
-.hit-count { flex: 0 0 auto; font-size: 11px; color: var(--ink-3); padding-top: 2px; }
+.hit-count { flex: 0 0 auto; font-size: 12px; color: var(--ink-3); padding-top: 2px; }
 .hit-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .path {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; font-size: 11px; color: var(--ink-3);
+  white-space: nowrap; font-size: 12px; color: var(--ink-3);
 }
 .actions { flex: 0 0 auto; display: flex; gap: 5px; }
 .icon-btn {
   width: 28px; height: 28px; flex: 0 0 auto; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
-  border: 1px solid var(--line); border-radius: 6px;
-  background: var(--info-soft); color: var(--info-deep); cursor: pointer;
+  border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink-2); cursor: pointer;
 }
-.icon-btn:hover:not(:disabled) { border-color: var(--info); color: var(--accent-strong); }
+.icon-btn:hover:not(:disabled) { border-color: var(--line); background: var(--paper-2); color: var(--ink); }
 .icon-btn:disabled { opacity: 0.38; cursor: not-allowed; }
 .icon-btn svg { width: 16px; height: 16px; }
 .pv-text {
@@ -516,7 +911,95 @@ onUnmounted(() => {
   font-family: inherit; margin: 0; padding: 12px; background: var(--paper-2);
   border-radius: var(--radius-sm);
 }
-.pv-wrap { overflow-x: auto; }
-.pv-table { border-collapse: collapse; font-size: 12px; }
-.pv-table td { border: 1px solid var(--line); padding: 5px 9px; }
+.pv-head { display: flex; align-items: center; gap: 10px; width: 100%; }
+.pv-head-title {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pv-more { margin-top: 6px; }
+.pv-table-head { display: flex; align-items: center; gap: 4px; margin: 14px 0 6px; flex-wrap: wrap; }
+.pv-table-scroll {
+  overflow: auto; max-height: min(62vh, 760px);
+  border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+}
+/* 表格铺满抽屉宽度：原来按内容撑开，宽抽屉右侧会留一大片空白 */
+.pv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.pv-table td {
+  border: 1px solid var(--line); padding: 5px 9px; vertical-align: top;
+  min-width: 64px; max-width: 320px; word-break: break-word;
+}
+.pv-table tbody tr:hover td { background: var(--paper); }
+.pv-table thead td {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--paper-3); font-weight: 500; color: var(--ink); white-space: nowrap;
+}
+.pv-hint { margin-top: 4px; font-size: 12px; }
+.pv-chip {
+  display: inline-block; margin: 0 2px; padding: 1px 6px; font-size: 12px;
+  font-family: inherit; color: var(--info-deep); background: var(--info-soft);
+  border: none; border-radius: 4px; cursor: pointer; vertical-align: baseline;
+}
+.pv-chip:hover { filter: brightness(0.95); }
+.pv-fig {
+  margin: 6px auto; padding: 0; max-width: 420px; cursor: zoom-in;
+}
+.pv-fig img {
+  display: block; margin: 0 auto; width: auto; height: auto;
+  max-width: 100%; max-height: 340px;
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+}
+.pv-fig figcaption {
+  margin-top: 4px; font-size: 12px; color: var(--ink-3);
+  text-align: center; white-space: normal;
+}
+.pv-inline-img {
+  display: inline-block; vertical-align: middle; margin: 0 4px;
+  width: auto; height: auto; max-width: 180px; max-height: 130px;
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: 4px; cursor: zoom-in;
+}
+.pv-cell-img {
+  display: block; margin: 2px 0; width: auto; height: auto;
+  max-width: 160px; max-height: 120px;
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: 4px; cursor: zoom-in;
+}
+.pv-img-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%; margin: 14px 0 6px;
+  padding: 8px 10px; font-family: inherit; font-size: 12px; text-align: left;
+  color: var(--ink); background: var(--paper); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm); cursor: pointer;
+}
+.pv-img-toggle:hover { border-color: var(--line); }
+.pv-caret { font-size: 12px; color: var(--ink-3); }
+.pv-img-toggle-hint { font-size: 12px; color: var(--ink-3); }
+.pv-images { margin-top: 16px; }
+.pv-grid {
+  display: grid; gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+}
+.pv-thumb {
+  display: flex; flex-direction: column; gap: 4px; padding: 6px; cursor: pointer;
+  background: var(--paper-2); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm); text-align: left;
+}
+.pv-thumb:hover { border-color: var(--line); }
+.pv-thumb img {
+  width: 100%; height: 96px; object-fit: contain;
+  background: #fff; border-radius: 3px;
+}
+.pv-thumb-cap {
+  font-size: 12px; color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pv-viewer {
+  display: flex; align-items: center; justify-content: center;
+  max-height: calc(100vh - 260px); overflow: auto;
+  background: var(--paper-2); border-radius: var(--radius-sm);
+}
+.pv-viewer.is-fit img { max-width: 100%; max-height: calc(100vh - 280px); cursor: zoom-in; }
+.pv-viewer:not(.is-fit) { align-items: flex-start; justify-content: flex-start; }
+.pv-viewer:not(.is-fit) img { max-width: none; max-height: none; cursor: zoom-out; }
+.pv-big-scroll { max-height: calc(100vh - 250px); overflow: auto; }
+.pv-table.is-big td { min-width: 96px; max-width: 480px; }
 </style>

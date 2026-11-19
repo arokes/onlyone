@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""SAP 启动链路回归验收（A 连接项名 / B1 窗口置前 / B2 启动校验 / 路径可配置）。
+"""SAP 启动链路回归验收（A 系统标识 / B1 窗口置前 / B2 启动校验 / 路径可配置）。
 
 用法：py -3 tools\\verify_sap.py
 
 自带后端进程 + 临时数据库，不污染真实 data/onlyone.db。
-会真实打开一次 SAP GUI 会话窗口（按 DS4|100），结束后关闭本次新开的窗口。
-依赖：本机已安装 SAP GUI 且 SAPUILandscape.xml 中存在 DS4 客户端 100 的连接项。
+会真实拉起一次 SAP Logon 登录框（DS4 客户端 100），结束后关闭本次新开的窗口。
+依赖：本机已安装 SAP GUI，且 SAP Logon 中存在系统标识 DS4 的客户端 100。
 """
 from __future__ import annotations
 
@@ -51,15 +51,20 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
 
 
 def close_new_windows(sap_mod, before: set[int]) -> int:
-    """只关本次回归新开的 SAP GUI 会话窗口，不碰用户原有窗口。"""
+    """只关本次回归新开的窗口，不碰用户原有的 SAP Logon 与已登录会话。"""
     closed = 0
-    for win in sap_mod.sap_windows("sapgui.exe"):
-        if win["hwnd"] not in before:
-            try:
-                ctypes.windll.user32.PostMessageW(win["hwnd"], 0x0010, 0, 0)  # WM_CLOSE
-                closed += 1
-            except Exception:  # noqa: BLE001
-                pass
+    for win in sap_mod.sap_windows():
+        if win["hwnd"] in before:
+            continue
+        if (win.get("title") or "").startswith("SAP Logon"):
+            continue  # 主窗口不是本次产物
+        if win["proc"] not in {"sapgui.exe", "saplogon.exe", "sapshcut.exe"}:
+            continue
+        try:
+            ctypes.windll.user32.PostMessageW(win["hwnd"], 0x0010, 0, 0)  # WM_CLOSE
+            closed += 1
+        except Exception:  # noqa: BLE001
+            pass
     return closed
 
 
@@ -73,9 +78,9 @@ def main() -> int:
         from fastapi import HTTPException
         from onlyone import sap as sap_mod
 
-        before = {w["hwnd"] for w in sap_mod.sap_windows("sapgui.exe")}
+        before = {w["hwnd"] for w in sap_mod.sap_windows()}
         if before:
-            print("NOTE 已有 %d 个 SAP GUI 会话窗口，B2 可能判定为「复用」" % len(before),
+            print("NOTE 已有 %d 个 SAP 窗口，收尾只关闭本次新增的" % len(before),
                   flush=True)
 
         with socket.socket() as sock:
@@ -110,8 +115,9 @@ def main() -> int:
 
             _, systems = http(base, "/api/sap/systems")
             item = next((s for s in systems if s["key"] == "DS4|100"), None)
-            results.append(check("A：DS4|100 映射到连接项 DS4-100ZH",
-                                 bool(item and item["launch_name"] == "DS4-100ZH"),
+            results.append(check("A：DS4|100 的启动用标识是 SID=DS4（连接项名仅展示）",
+                                 bool(item and item.get("launch_system") == "DS4"
+                                      and item.get("launch_name") == "DS4-100ZH"),
                                  str(item)))
 
             code, _ = http(base, "/api/sap/config", "PUT",
@@ -135,17 +141,18 @@ def main() -> int:
                             "password": "", "sap_conn": "DS4|100"})
             cid = cred["id"]
             _, launched = http(base, "/api/credentials/%d/open-sap" % cid, "POST")
-            results.append(check("A：按绑定启动使用连接项名",
-                                 launched.get("launch_name") == "DS4-100ZH",
-                                 "source=%s" % launched.get("source")))
+            results.append(check("A：按绑定启动解析出系统 SID",
+                                 launched.get("launch_name") == "DS4",
+                                 "launch_name=%s source=%s" % (
+                                     launched.get("launch_name"), launched.get("source"))))
             ok = launched.get("verified") is True
             if not ok and "复用" in str(launched.get("detail", "")):
                 print("NOTE 复用了已有会话窗口，verified=false 属预期降级", flush=True)
                 ok = True
-            results.append(check("B2：确认出现 SAP GUI 会话窗口", ok,
+            results.append(check("B2：确认出现 SAP Logon 登录框", ok,
                                  "verified=%s front=%s" % (launched.get("verified"),
                                                            launched.get("front"))))
-            results.append(check("B1：会话窗口已尝试置前",
+            results.append(check("B1：登录框已尝试置前",
                                  "front" in launched, "front=%s" % launched.get("front")))
 
             _, logon = http(base, "/api/open-sap", "POST")
@@ -154,23 +161,84 @@ def main() -> int:
                                  "reused=%s front=%s" % (logon.get("reused"),
                                                          logon.get("front"))))
 
-            # --- B2 失败路径：模拟 sapshcut 退出 0 但无窗口 ---
+            # --- 失败路径 1：既没登录框也没对话框（sapshcut 退出 0 但无窗口）---
             class FakeProc:
                 def poll(self):
                     return 0
 
             with patch.object(sap_mod.subprocess, "Popen", return_value=FakeProc()), \
-                 patch.object(sap_mod, "_wait_new_session", return_value=None), \
+                 patch.object(sap_mod, "_wait_sap_ready", return_value=(None, None)), \
                  patch.object(sap_mod, "sap_windows", return_value=[]):
                 try:
-                    sap_mod.launch_connection("ZZZ|999", "")
+                    sap_mod.launch_connection("DS4|100", "")
                     failed_loudly = False
                 except HTTPException as exc:
                     failed_loudly = exc.status_code == 502
             results.append(check("B2：静默失败返回 502 明确错误而非假成功",
                                  failed_loudly))
-            results.append(check("A：旧凭据 DS4|120 仍映射到 DS4-120ZH",
-                                 sap_mod.resolve_launch_name("DS4|120")[0] == "DS4-120ZH"))
+
+            # --- 失败路径 2：GUI 弹属性对话框（即「部分数据不可用」）---
+            with patch.object(sap_mod.subprocess, "Popen", return_value=FakeProc()), \
+                 patch.object(sap_mod, "_wait_sap_ready",
+                              return_value=(None, {"title": "SAP 快捷方式属性"})), \
+                 patch.object(sap_mod, "sap_windows", return_value=[]):
+                try:
+                    sap_mod.launch_connection("DS4|100", "")
+                    dialog_code, dialog_detail = None, ""
+                except HTTPException as exc:
+                    dialog_code, dialog_detail = exc.status_code, str(exc.detail)
+            results.append(check("B2：属性对话框被识别为失败并回报标题",
+                                 dialog_code == 502 and "快捷方式属性" in dialog_detail,
+                                 "code=%s %s" % (dialog_code, dialog_detail[:40])))
+
+            # --- A：启动参数形态（-system 只传 SID，传连接项名会 LoadAll 516）---
+            captured: dict = {}
+
+            def fake_popen(argv, *a, **kw):
+                captured["argv"] = list(argv)
+                return FakeProc()
+
+            with patch.object(sap_mod.subprocess, "Popen", side_effect=fake_popen), \
+                 patch.object(sap_mod, "_wait_sap_ready", return_value=(None, None)), \
+                 patch.object(sap_mod, "sap_windows", return_value=[]):
+                try:
+                    sap_mod.launch_connection("DS4|120", "10000265")
+                except HTTPException:
+                    pass
+            argv = captured.get("argv", [])
+            results.append(check("A：-system 只传 SID，不含连接项名",
+                                 "-system=DS4" in argv
+                                 and not any("DS4-120ZH" in a for a in argv),
+                                 " ".join(argv)))
+            results.append(check("A：-client 取自凭据绑定",
+                                 "-client=120" in argv, " ".join(argv)))
+            results.append(check("A：-user 带用户名且不带 -pw（A 档）",
+                                 "-user=10000265" in argv
+                                 and not any(a.lower().startswith("-pw") for a in argv),
+                                 " ".join(argv)))
+
+            # --- 窗口识别：登录框算成功，属性框算失败 ---
+            results.append(check("B2：Logon 登录框识别为成功标志",
+                                 sap_mod._is_login_prompt(
+                                     {"proc": "saplogon.exe",
+                                      "title": "SAP GUI 快捷方式 - 登录 (DS4, 120, ZH, )"})
+                                 and not sap_mod._is_login_prompt(
+                                     {"proc": "saplogon.exe", "title": "SAP Logon 800"})))
+            results.append(check("B2：属性对话框不计为会话/登录窗口",
+                                 not sap_mod._is_session_window(
+                                     {"proc": "sapgui.exe", "title": "SAP 快捷方式属性"})
+                                 and sap_mod._is_error_dialog(
+                                     {"proc": "saplogon.exe", "title": "系统条目属性"})))
+
+            # --- 绑定值解析：SID|客户端 与 连接项名 都要落到 SID ---
+            r1 = sap_mod.resolve_launch("DS4|120")
+            r2 = sap_mod.resolve_launch("DS4-120ZH")
+            results.append(check("A：DS4|120 解析为 SID=DS4 / client=120",
+                                 r1["sid"] == "DS4" and r1["client"] == "120", str(r1)))
+            results.append(check("A：连接项名 DS4-120ZH 反查为 SID=DS4",
+                                 r2["sid"] == "DS4" and r2["client"] == "120", str(r2)))
+            results.append(check("A：QS4|100 解析为 SID=QS4",
+                                 sap_mod.resolve_launch("QS4|100")["sid"] == "QS4"))
 
             # --- 目录选择框：模拟用户选目录，不弹真实窗口 ---
             with patch("tkinter.Tk"), \

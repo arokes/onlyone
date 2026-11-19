@@ -13,6 +13,8 @@ xlrd==2.0.1
 charset-normalizer>=3.4
 pypdf>=6.0
 olefile>=0.47
+# M7 起：OneNote .mht 导入（HTML 解析）与 docx 依赖
+lxml>=5.0
 # M6-1 扫描件 OCR / M6-2 稀疏向量
 Pillow>=10.0
 numpy>=1.26

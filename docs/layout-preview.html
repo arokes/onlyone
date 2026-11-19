@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>记事本 · 布局预览</title>
+<style>
+  :root {
+    --paper: #f8f4ec;
+    --paper-2: #f1e9dc;
+    --paper-3: #ece2d3;
+    --surface: #fffdf9;
+    --ink: #26231e;
+    --ink-2: #5c564c;
+    --ink-3: #6f675b;
+    --line: #e5dbcd;
+    --line-soft: #efe7da;
+    --accent: #bf5a36;
+    --accent-strong: #a44524;
+    --accent-soft: #f7e5da;
+    --info: #3e6288;
+    --info-deep: #2e4d6c;
+    --success: #4d7459;
+    --radius: 10px;
+    --radius-sm: 6px;
+    --shadow: 0 18px 40px -32px rgba(57, 38, 22, .35);
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--paper); color: var(--ink);
+    font: 13px/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- 外层：与 OnlyOne 一致的左侧导航 + 内容区 ---------- */
+  .app { height: 100vh; display: flex; overflow: hidden; }
+
+  .side-nav {
+    width: 168px; flex: 0 0 168px; height: 100%;
+    background: var(--paper-2); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; padding: 16px 12px;
+  }
+  .brand { font-size: 15px; font-weight: 700; letter-spacing: .3px; margin: 0 6px 18px; }
+  .brand small { display: block; font-size: 10px; font-weight: 400; color: var(--ink-3); letter-spacing: 0; }
+  .nav-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 10px; margin-bottom: 2px; border-radius: var(--radius-sm);
+    font-size: 12.5px; color: var(--ink-2); cursor: default;
+  }
+  .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); }
+  .nav-item.active { background: var(--surface); color: var(--accent-strong); font-weight: 600; box-shadow: var(--shadow); }
+  .nav-item.active .dot { background: var(--accent); }
+  .nav-foot { margin-top: auto; font-size: 10.5px; color: var(--ink-3); padding: 0 6px; }
+
+  .content {
+    flex: 1; min-width: 0; min-height: 0;
+    padding: 14px 18px 16px;
+    display: flex; flex-direction: column;
+    overflow: hidden;              /* 记事本自己管滚动，外层不再整页滚 */
+  }
+
+  /* ---------- 记事本三区 ---------- */
+  .notes { display: flex; flex-direction: column; gap: 8px; height: 100%; min-height: 0; }
+
+  /* ① 顶部：笔记本下拉 + 分区页签（固定，永不随内容滚动） */
+  .topbar {
+    flex: 0 0 auto; display: flex; align-items: flex-end; gap: 7px; min-width: 0;
+    padding-bottom: 0;
+  }
+  .book-select {
+    display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+    height: 27px; padding: 0 8px; font-size: 12px; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius-sm); min-width: 132px;
+  }
+  .book-select .arrow { margin-left: auto; color: var(--ink-3); font-size: 9px; }
+  .icon-btn {
+    height: 27px; min-width: 27px; padding: 0 7px; font: inherit; font-size: 12px;
+    color: var(--ink-2); background: transparent; border: 1px solid transparent;
+    border-radius: var(--radius-sm); cursor: pointer;
+  }
+  .icon-btn:hover { background: var(--paper-2); border-color: var(--line-soft); }
+
+  .tabs {
+    flex: 1 1 auto; min-width: 0;
+    display: flex; align-items: flex-end; gap: 4px;
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  .tabs::-webkit-scrollbar { height: 4px; }
+  .tabs::-webkit-scrollbar-thumb { background: var(--line); border-radius: 2px; }
+  .tabs::-webkit-scrollbar-track { background: transparent; }
+
+  /* 滚动条：细、暖色，明确提示「这一块自己是滚动容器」 */
+  .page-list, .editor-body { scrollbar-width: thin; scrollbar-color: var(--paper-3) transparent; }
+  .page-list::-webkit-scrollbar, .editor-body::-webkit-scrollbar { width: 9px; }
+  .page-list::-webkit-scrollbar-thumb, .editor-body::-webkit-scrollbar-thumb {
+    background: var(--paper-3); border-radius: 5px;
+    border: 2px solid var(--surface);
+  }
+  .page-list::-webkit-scrollbar-thumb:hover, .editor-body::-webkit-scrollbar-thumb:hover {
+    background: var(--line);
+  }
+  .page-list::-webkit-scrollbar-track, .editor-body::-webkit-scrollbar-track { background: transparent; }
+
+  .tab {
+    flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px;
+    height: 28px; padding: 0 11px; font: inherit; font-size: 12px;
+    color: var(--ink-2); background: var(--paper-2);
+    border: 1px solid var(--line-soft); border-bottom: none;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    cursor: pointer; white-space: nowrap;
+  }
+  .tab:hover { color: var(--ink); border-color: var(--line); }
+  .tab.active {
+    background: var(--surface); color: var(--accent-strong); font-weight: 600;
+    border-color: var(--line); position: relative; top: 1px;
+  }
+  .tab-count {
+    font-size: 10px; line-height: 15px; padding: 0 5px; border-radius: 8px;
+    background: var(--paper-3); color: var(--ink-3); font-weight: 400;
+  }
+  .tab.active .tab-count { background: var(--accent-soft); color: var(--accent-strong); }
+
+  /* ② 主体：左右两栏，各自独立滚动 */
+  .body { flex: 1 1 auto; min-height: 0; display: flex; gap: 12px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+  }
+
+  .pages {
+    width: 212px; flex: 0 0 212px;
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+    padding: 0;
+  }
+  .pages-head {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+    padding: 9px 12px 7px; border-bottom: 1px solid var(--line-soft);
+    font-size: 12px; color: var(--ink-3);
+  }
+  .pages-head b { color: var(--ink); font-weight: 600; }
+  .page-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 8px 10px; }
+  .page-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; margin-bottom: 1px; border-radius: var(--radius-sm);
+    font-size: 12px; color: var(--ink-2); cursor: pointer;
+  }
+  .page-row:hover { background: var(--paper-2); }
+  .page-row.active { background: var(--accent-soft); color: var(--accent-strong); font-weight: 600; }
+  .page-row .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { font-size: 9.5px; padding: 0 4px; border-radius: 3px; background: var(--paper-3); color: var(--ink-3); }
+
+  .editor { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .editor-top { flex: 0 0 auto; padding: 10px 14px 0; }
+  .title-row { display: flex; align-items: center; gap: 8px; }
+  .title-input {
+    flex: 1; min-width: 0; height: 30px; padding: 0 9px; font: inherit; font-size: 13px;
+    color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--radius-sm); outline: none;
+  }
+  .title-input:focus { border-color: var(--info); }
+  .muted { color: var(--ink-3); font-size: 11.5px; }
+  .pill { font-size: 10.5px; padding: 1px 7px; border-radius: 9px; background: #e8f0e9; color: var(--success); }
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 5px; align-items: center;
+    padding: 9px 0 10px; border-bottom: 1px solid var(--line-soft); margin-top: 8px;
+  }
+  .tbtn {
+    font: inherit; font-size: 11.5px; padding: 2px 9px; cursor: pointer;
+    color: var(--info-deep); background: var(--paper-2);
+    border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+  }
+  .tbtn:hover { border-color: var(--line); }
+  .toolbar .hint { margin-left: auto; }
+
+  /* ③ 编辑器正文：自己的滚动容器 */
+  .editor-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px 18px 20px; }
+  .doc h2 { font-size: 16px; margin: 4px 0 10px; }
+  .doc p { margin: 0 0 9px; line-height: 1.8; font-size: 13px; }
+  .doc table { border-collapse: collapse; width: 100%; margin: 10px 0 14px; table-layout: fixed; }
+  .doc th, .doc td { border: 1px solid var(--line); padding: 5px 8px; font-size: 12px; vertical-align: top; word-break: break-word; }
+  .doc th { background: var(--paper-2); font-weight: 600; text-align: left; }
+  .doc .fig {
+    height: 150px; margin: 10px 0; border: 1px dashed var(--line);
+    border-radius: var(--radius-sm); background: var(--paper-2);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-3); font-size: 11.5px;
+  }
+
+  .editor-foot {
+    flex: 0 0 auto; display: flex; gap: 6px; align-items: center;
+    padding: 9px 14px; border-top: 1px solid var(--line-soft);
+  }
+  .primary {
+    margin-left: auto; font: inherit; font-size: 11.5px; padding: 3px 12px;
+    color: #fff; background: var(--accent-strong); border: none;
+    border-radius: var(--radius-sm); cursor: pointer;
+  }
+
+  /* 提示浮层 */
+  .tip {
+    position: fixed; right: 18px; bottom: 16px; max-width: 330px;
+    background: var(--info-deep); color: #f2f6fa; font-size: 11.5px; line-height: 1.7;
+    padding: 10px 12px; border-radius: var(--radius); box-shadow: 0 10px 30px -14px rgba(0,0,0,.5);
+  }
+  .tip b { color: #fff; }
+  .tip .close { float: right; margin-left: 8px; cursor: pointer; opacity: .7; }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="side-nav">
+    <div class="brand">OnlyOne<small>v0.8 · 暖纸主题</small></div>
+    <div class="nav-item"><span class="dot"></span>全局搜索</div>
+    <div class="nav-item active"><span class="dot"></span>记事本</div>
+    <div class="nav-item"><span class="dot"></span>项目事项</div>
+    <div class="nav-item"><span class="dot"></span>工作日志</div>
+    <div class="nav-item"><span class="dot"></span>运维记录</div>
+    <div class="nav-item"><span class="dot"></span>凭据库</div>
+    <div class="nav-item"><span class="dot"></span>索引目录</div>
+    <div class="nav-foot">滚动试试：三块区域互不影响</div>
+  </nav>
+
+  <main class="content">
+    <div class="notes">
+      <!-- 顶部固定区 -->
+      <div class="topbar">
+        <div class="book-select">SAP 笔记 <span class="arrow">▼</span></div>
+        <button class="icon-btn" title="笔记本：新建 / 改名 / 删除">⋯</button>
+        <div class="tabs" id="tabs"></div>
+        <button class="icon-btn">导入</button>
+        <button class="icon-btn">+ 分区</button>
+      </div>
+
+      <div class="body">
+        <!-- 左侧：当前分区的页面列表，独立滚动 -->
+        <aside class="card pages">
+          <div class="pages-head">
+            <span id="pages-title"><b>随记</b> · 33 页</span>
+            <button class="icon-btn" style="margin-left:auto">+ 页面</button>
+          </div>
+          <div class="page-list" id="page-list"></div>
+        </aside>
+
+        <!-- 右侧：编辑器，独立滚动 -->
+        <section class="card editor">
+          <div class="editor-top">
+            <div class="title-row">
+              <input class="title-input" id="note-title" value="晶盛MM接口列表">
+              <span class="muted">不参与检索</span>
+              <span class="pill">已保存</span>
+            </div>
+            <div class="toolbar">
+              <button class="tbtn">B</button>
+              <button class="tbtn">I</button>
+              <button class="tbtn">H2</button>
+              <button class="tbtn">列表</button>
+              <button class="tbtn">代码</button>
+              <button class="tbtn">表格</button>
+              <button class="tbtn">图片</button>
+              <span class="muted hint">改动后 1 秒自动保存 · revision 7</span>
+            </div>
+          </div>
+          <div class="editor-body">
+            <div class="doc">
+              <h2>ZMM 采购接口清单</h2>
+              <p>以下为 MM 模块自开发接口的入参出参约定，字段命名统一使用大写下划线风格，报文示例见备注列。</p>
+              <table>
+                <thead>
+                  <tr><th style="width:32%">函数名</th><th style="width:38%">函数描述</th><th>备注</th></tr>
+                </thead>
+                <tbody id="table-body"></tbody>
+              </table>
+              <p>调用约定：同步接口超时 60 秒；失败时返回 <code>TYPE=E</code> 与 <code>MESSAGE</code>，调用方需记录 XMBG 日志。</p>
+              <div class="fig">［截图：SAP 事务码 MIGO 过账界面 · 1200×720］</div>
+              <p>补充说明 1：库存地点与工厂的对应关系维护在 T001L，接口传参前需校验。</p>
+              <p>补充说明 2：批次管理的物料过账时必须带 XCHPF 标识，否则回滚。</p>
+              <p>补充说明 3：这部分内容故意写长，用来验证右侧独立滚动——向下滚动时，顶部页签与左侧页面列表应保持不动。</p>
+              <p>补充说明 4：左侧列表同样可以独立滚动，滚动它时右侧正文位置不应变化。</p>
+              <div class="fig">［截图：接口返回报文 · 900×520］</div>
+              <p>补充说明 5：MSU 单位换算走 MARM 表，换算因子为分子/分母，浮点精度按 3 位小数处理。</p>
+              <p>补充说明 6：如果报文为空，接口返回空表而不是报错，调用方需自行判空。</p>
+            </div>
+          </div>
+          <div class="editor-foot">
+            <button class="tbtn">导出本页 MD</button>
+            <button class="tbtn">导出 HTML + 图片</button>
+            <button class="primary">全库备份</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="tip" id="tip">
+  <span class="close" onclick="document.getElementById('tip').remove()">✕</span>
+  <b>布局确认点</b><br>
+  ① 顶部「分区页签」固定，右侧内容滚动时不动<br>
+  ② 左侧页面列表独立滚动<br>
+  ③ 右侧正文独立滚动，不影响左侧<br>
+  页签过多时只在页签栏内部横向滚动
+</div>
+
+<script>
+  const sections = [
+    { name: '随记', pages: 33 }, { name: 'MM', pages: 7 }, { name: 'ABAP', pages: 12 },
+    { name: 'BASIC', pages: 8 }, { name: 'PP', pages: 15 }, { name: 'PP资料', pages: 21 },
+    { name: 'PS', pages: 3 }, { name: '帆软报表SQL', pages: 5 }, { name: '晶盛PP配置', pages: 11 },
+  ]
+  const samplePages = [
+    '基于SAP的Lean APS', '工程变更', '工程变更2', '工程变更3', '工程变更4', '工程变更5',
+    '工程变更6', '工程变更--权限对象', '产品开发文档--确认会议', '功能用户手册标题模板',
+    '0205-细化变更执行', '0205-处理建议', '0206主生产计划', '0206帆软功能开发说明书',
+    '0206功能说明书2', '0206功能说明书3', '工程--0225', '0313工程变更执行', 'MES稳定性',
+    '用友切换案例分享', '晶盛机电量产业务主线流程', '0918晶鸿系统流程',
+    '样机管理平台需求指标数据梳理', '用友方案沟通', 'SE24 ZCL_ENCG_NTC 校验问题',
+    '测试工程变更', 'MD_PIR_FLEX_CONS', '11-24', '晶鸿表处物料表面积成本影响测试',
+    '需求优化记录', '接口联调记录', '权限对象清单', '待办清单',
+  ]
+
+  const tabsEl = document.getElementById('tabs')
+  const listEl = document.getElementById('page-list')
+  const titleEl = document.getElementById('pages-title')
+  const noteTitle = document.getElementById('note-title')
+  let active = 0
+
+  function render() {
+    tabsEl.innerHTML = sections.map((s, i) =>
+      `<button class="tab${i === active ? ' active' : ''}" data-i="${i}">
+         ${s.name}<span class="tab-count">${s.pages}</span>
+       </button>`).join('')
+
+    const sec = sections[active]
+    const names = active === 0
+      ? samplePages.slice(0, sec.pages)
+      : Array.from({ length: sec.pages }, (_, i) => `${sec.name} 页面 ${i + 1}`)
+    titleEl.innerHTML = `<b>${sec.name}</b> · ${sec.pages} 页`
+    listEl.innerHTML = names.map((n, i) =>
+      `<div class="page-row${i === 0 ? ' active' : ''}">
+         <span class="t">${n}</span>${i === 2 ? '<span class="badge">私密</span>' : ''}
+       </div>`).join('')
+    noteTitle.value = names[0] || ''
+
+    tabsEl.querySelectorAll('.tab').forEach(el => {
+      el.onclick = () => {
+        active = Number(el.dataset.i)
+        render()
+      }
+    })
+    listEl.querySelectorAll('.page-row').forEach(el => {
+      el.onclick = () => {
+        listEl.querySelectorAll('.page-row').forEach(x => x.classList.remove('active'))
+        el.classList.add('active')
+        noteTitle.value = el.querySelector('.t').textContent
+      }
+    })
+  }
+
+  const rows = [
+    ['ZMM_LFM1_EVENT_DCHCK', 'BP采购视图增强-DCHCK', ''],
+    ['ZMM_LFM1_EVENT_DSAVB', 'BP采购视图增强-DSAVB', ''],
+    ['ZMM001_SCRK_POST', '生产入库过账', '同步返回'],
+    ['ZMM002_STOCK_QUERY', '库存查询', '分页 500'],
+    ['ZMM003_PO_CREATE', '采购订单创建', '幂等号必填'],
+    ['ZMM004_GOODSMVT', '货物移动', '含批次'],
+    ['ZMM005_VENDOR_SYNC', '供应商主数据同步', ''],
+    ['ZMM006_PR_RELEASE', '采购申请审批', ''],
+    ['ZMM007_CREATE_GOODSMVT', '货物移动（新）', '替代 004'],
+    ['ZMM008_MRP_LIST', 'MRP 清单查询', '大结果集'],
+    ['ZMM009_BATCH_SPLIT', '批次拆分', ''],
+    ['ZMM010_STOCK_TRANSFER', '库存转储', '跨工厂'],
+  ]
+  document.getElementById('table-body').innerHTML = rows
+    .map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`).join('')
+
+  render()
+</script>
+</body>
+</html>
