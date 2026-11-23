@@ -12,9 +12,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { EditorContent, useEditor } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import TiptapImage from '@tiptap/extension-image'
-import { TableKit } from '@tiptap/extension-table'
+import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
 import {
-  NButton, NDropdown, NInput, NModal, NSelect, NSwitch, NTag, useDialog, useMessage,
+  NButton, NDropdown, NInput, NInputNumber, NModal, NSelect, NSwitch, NTag,
+  useDialog, useMessage,
 } from 'naive-ui'
 import { api, TOKEN } from '@/api/client'
 import EmptyState from '@/components/EmptyState.vue'
@@ -56,6 +57,9 @@ const busy = ref(false)
 const imageBusy = ref(0)                    // 待上传 + 上传中的图片数
 const tableActive = ref(false)              // 光标是否在表格内（决定菜单项是否可用）
 const tableMenuShow = ref(false)
+// 自定义行高对话框（表格菜单 → 行高：自定义…）
+const showRowHeight = ref(false)
+const rowHeightValue = ref<number | null>(36)
 
 const showDialog = ref(false)
 const dialogMode = ref<'book' | 'section'>('book')
@@ -68,13 +72,40 @@ let loadingContent = false
 let uploadChain: Promise<void> = Promise.resolve()   // 多图串行，保证插入顺序
 let disposed = false
 
+/** 表格节点：在原生 Table 上加 rowHeight 属性（px）。
+ *
+ * Tiptap 没有行高概念（合并单元格下"行高"本身有歧义），这里用整表行高：
+ * 属性随 content_json 持久化，渲染成 CSS 变量 --row-h，由单元格 height 生效。
+ * 列宽仍走原生 resizable（写 colwidth，随文档保存，换设备不再重算跳动）。
+ */
+const TableWithHeight = Table.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      rowHeight: {
+        default: null,
+        parseHTML: el => el.getAttribute('data-row-height'),
+        renderHTML: attrs => (attrs.rowHeight
+          ? { 'data-row-height': String(attrs.rowHeight), style: `--row-h:${attrs.rowHeight}px` }
+          : {}),
+      },
+    }
+  },
+})
+
 const editor = useEditor({
   extensions: [
     StarterKit,
     TiptapImage,
-    // 表格：resizable=false —— 列宽不进 content_json，换设备重算会跳，先不做拖拽调宽。
     // allowTableNodeSelection 让点表格边缘可整表选中，方便删除 / 剪切。
-    TableKit.configure({ table: { resizable: false, allowTableNodeSelection: true } }),
+    TableWithHeight.configure({
+      resizable: true,
+      lastColumnResizable: true,
+      allowTableNodeSelection: true,
+    }),
+    TableRow,
+    TableHeader,
+    TableCell,
   ],
   content: '',
   editorProps: {
@@ -230,6 +261,11 @@ const tableMenuOptions = computed<TableMenuItem[]>(() => {
     { label: '合并单元格', key: 'merge', disabled: !inTable },
     { label: '拆分单元格', key: 'split', disabled: !inTable },
     { type: 'divider', key: 'd3' },
+    { label: '行高：紧凑 26px', key: 'h-compact', disabled: !inTable },
+    { label: '行高：标准 36px', key: 'h-normal', disabled: !inTable },
+    { label: '行高：宽松 52px', key: 'h-loose', disabled: !inTable },
+    { label: '行高：自定义…', key: 'h-custom', disabled: !inTable },
+    { type: 'divider', key: 'd4' },
     { label: '删除当前行', key: 'row-delete', disabled: !inTable },
     { label: '删除当前列', key: 'col-delete', disabled: !inTable },
     { label: '删除整个表格', key: 'delete', disabled: !inTable },
@@ -247,9 +283,23 @@ function onTableMenuSelect(key: string | number) {
   else if (key === 'col-after') c().addColumnAfter().run()
   else if (key === 'merge') c().mergeCells().run()
   else if (key === 'split') c().splitCell().run()
+  else if (key === 'h-compact') c().updateAttributes('table', { rowHeight: 26 }).run()
+  else if (key === 'h-normal') c().updateAttributes('table', { rowHeight: 36 }).run()
+  else if (key === 'h-loose') c().updateAttributes('table', { rowHeight: 52 }).run()
+  else if (key === 'h-custom') {
+    rowHeightValue.value = 36
+    showRowHeight.value = true
+  }
   else if (key === 'row-delete') c().deleteRow().run()
   else if (key === 'col-delete') c().deleteColumn().run()
   else if (key === 'delete') c().deleteTable().run()
+}
+
+/** 自定义行高：夹在 18–400px，避免手滑输入出极端值 */
+function applyRowHeight() {
+  const px = Math.min(400, Math.max(18, Number(rowHeightValue.value) || 36))
+  editor.value?.chain().focus().updateAttributes('table', { rowHeight: px }).run()
+  showRowHeight.value = false
 }
 
 // ---------------------------------------------------------------- OneNote 导入
@@ -273,15 +323,44 @@ const importResult = ref<ImportResp | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const dirInput = ref<HTMLInputElement | null>(null)
 
-const importMenuOptions = [
-  { label: '选择 .mht 文件（可多选）', key: 'files' },
-  { label: '选择文件夹', key: 'dir' },
-]
+/** 顶部「更多」：导入 / 导出 / 备份三组。
+ *  导出范围由当前打开页面推导（页面 → 分区 → 笔记本），没有页面时置灰。 */
+type FileMenuItem =
+  | { label: string; key: string; disabled?: boolean }
+  | { type: 'divider'; key: string }
 
-function onImportMenuSelect(key: string | number) {
-  if (importing.value) return
-  if (key === 'files') fileInput.value?.click()
-  else if (key === 'dir') dirInput.value?.click()
+const fileMenuOptions = computed<FileMenuItem[]>(() => {
+  const noBook = !activeBookId.value || importing.value
+  const noNote = !activeNote.value
+  return [
+    { label: '导入 OneNote .mht 文件（可多选）', key: 'import-files', disabled: noBook },
+    { label: '导入文件夹', key: 'import-dir', disabled: noBook },
+    { type: 'divider', key: 'fd1' },
+    { label: '导出本页 Markdown（.md）', key: 'export-page-md', disabled: !activeId.value },
+    { label: '导出本页 HTML + 图片（.zip）', key: 'export-page-zip', disabled: !activeId.value },
+    { label: '导出当前分区（.zip）', key: 'export-section', disabled: noNote },
+    { label: '导出整个笔记本（.zip）', key: 'export-notebook', disabled: noNote },
+    { type: 'divider', key: 'fd2' },
+    { label: '备份全库（写 data/backups）', key: 'backup' },
+  ]
+})
+
+function onFileMenuSelect(key: string | number) {
+  if (key === 'import-files') {
+    if (!importing.value) fileInput.value?.click()
+  } else if (key === 'import-dir') {
+    if (!importing.value) dirInput.value?.click()
+  } else if (key === 'export-page-md') {
+    void exportTo('page', 'md')
+  } else if (key === 'export-page-zip') {
+    void exportTo('page', 'zip')
+  } else if (key === 'export-section') {
+    void exportTo('section', 'zip')
+  } else if (key === 'export-notebook') {
+    void exportTo('notebook', 'zip')
+  } else if (key === 'backup') {
+    void backup()
+  }
 }
 
 function pickMht(list: FileList | null): File[] {
@@ -375,8 +454,136 @@ async function loadTree() {
   }
 }
 
-function onBookMenuSelect(key: string | number) {
+// ---------------------------------------------------------------- 拖拽排序
+// 分区在笔记本内调序（PUT /api/sections/{id}）；页面在分区内调序，
+// 也允许拖到别的分区页签上跨分区移动（POST /api/notes/{id}/move）。
+// 排序值统一重排为 1..n，避免多次拖拽后出现重复 / 稀疏的 sort_order。
+
+const dragSectionId = ref<number | null>(null)
+const dragNoteId = ref<number | null>(null)
+const dropSectionId = ref<number | null>(null)
+const dropNoteId = ref<number | null>(null)
+
+function beginDrag(e: DragEvent, id: number) {
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', String(id))
+  }
+}
+
+function onDragEnd() {
+  dragSectionId.value = null
+  dragNoteId.value = null
+  dropSectionId.value = null
+  dropNoteId.value = null
+}
+
+async function persistSectionOrder(ids: number[]) {
   const book = activeBook.value
+  if (!book) return
+  const byId = new Map(book.sections.map(s => [s.id, s]))
+  try {
+    await Promise.all(ids.map((id, index) => {
+      const section = byId.get(id)
+      if (!section) return Promise.resolve(null)
+      return api(`/api/sections/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          notebook_id: book.id, name: section.name, sort_order: index + 1,
+        }),
+      })
+    }))
+    await loadTree()
+  } catch (e) {
+    message.error('调整分区顺序失败：' + String(e))
+    await loadTree()
+  }
+}
+
+async function persistNoteOrder(sectionId: number, ids: number[]) {
+  try {
+    await Promise.all(ids.map((id, index) => api(`/api/notes/${id}/move`, {
+      method: 'POST',
+      body: JSON.stringify({ section_id: sectionId, sort_order: index + 1 }),
+    })))
+    await loadTree()
+  } catch (e) {
+    message.error('调整页面顺序失败：' + String(e))
+    await loadTree()
+  }
+}
+
+function onSectionDragStart(s: Section, e: DragEvent) {
+  if (renamingSectionId.value === s.id) return
+  dragSectionId.value = s.id
+  beginDrag(e, s.id)
+}
+
+function onSectionDragOver(s: Section, e: DragEvent) {
+  if (dragSectionId.value === null && dragNoteId.value === null) return
+  e.preventDefault()
+  dropSectionId.value = s.id
+}
+
+async function onSectionDrop(s: Section, e: DragEvent) {
+  e.preventDefault()
+  const movingNote = dragNoteId.value
+  const fromSection = dragSectionId.value
+  dropSectionId.value = null
+  if (movingNote) {
+    // 页面拖到分区页签：跨分区移动，顺序排到目标分区末尾
+    if (s.id === activeSectionId.value) { onDragEnd(); return }
+    onDragEnd()
+    try {
+      await api(`/api/notes/${movingNote}/move`, {
+        method: 'POST',
+        body: JSON.stringify({ section_id: s.id, sort_order: (s.notes.length || 0) + 1 }),
+      })
+      await loadTree()
+      selectSection(s.id)
+      message.success(`已移动到「${s.name}」`)
+    } catch (err) {
+      message.error('移动页面失败：' + String(err))
+    }
+    return
+  }
+  onDragEnd()
+  if (!fromSection || fromSection === s.id) return
+  const ids = (activeBook.value?.sections || []).map(x => x.id)
+  const from = ids.indexOf(fromSection)
+  const to = ids.indexOf(s.id)
+  if (from < 0 || to < 0) return
+  ids.splice(to, 0, ids.splice(from, 1)[0])
+  await persistSectionOrder(ids)
+}
+
+function onNoteDragStart(n: NoteMeta, e: DragEvent) {
+  dragNoteId.value = n.id
+  beginDrag(e, n.id)
+}
+
+function onNoteDragOver(n: NoteMeta, e: DragEvent) {
+  if (dragNoteId.value === null || dragNoteId.value === n.id) return
+  e.preventDefault()
+  dropNoteId.value = n.id
+}
+
+async function onNoteDrop(n: NoteMeta, e: DragEvent) {
+  e.preventDefault()
+  const moving = dragNoteId.value
+  dropNoteId.value = null
+  onDragEnd()
+  const sectionId = activeSectionId.value
+  if (!moving || moving === n.id || !sectionId) return
+  const ids = (activeSection.value?.notes || []).map(x => x.id)
+  const from = ids.indexOf(moving)
+  const to = ids.indexOf(n.id)
+  if (from < 0 || to < 0) return
+  ids.splice(to, 0, ids.splice(from, 1)[0])
+  await persistNoteOrder(sectionId, ids)
+}
+
+function onBookMenuSelect(key: string | number) {  const book = activeBook.value
   if (key === 'create') openDialog('book')
   else if (key === 'rename' && book) openDialog('book', book.id, book.name, 'rename')
   else if (key === 'delete' && book) confirmDelete('notebook', book.id, book.name)
@@ -758,30 +965,60 @@ function stripRemoteImages(html: string): string {
   return removed ? doc.body.innerHTML : html
 }
 
-async function download(scope: 'page' | 'section' | 'notebook', format: 'md' | 'html' | 'zip') {
-  let id = 0
-  if (scope === 'page') id = activeId.value ?? 0
-  else if (scope === 'section') id = activeNote.value?.section_id ?? 0
-  else {
-    const sectionId = activeNote.value?.section_id
-    id = books.value.find(b => b.sections.some(s => s.id === sectionId))?.id ?? 0
-  }
+function exportTarget(scope: 'page' | 'section' | 'notebook'): number {
+  if (scope === 'page') return activeId.value ?? 0
+  if (scope === 'section') return activeNote.value?.section_id ?? 0
+  const sectionId = activeNote.value?.section_id
+  return books.value.find(b => b.sections.some(s => s.id === sectionId))?.id ?? 0
+}
+
+/** 浏览器模式回退：让浏览器下载到它自己的下载目录（桌面窗口里下载默认被禁）。 */
+async function downloadViaBrowser(scope: string, id: number, format: string) {
+  const res = await fetch(
+    `/api/notes/export?scope=${scope}&id=${id}&format=${format}`,
+    { headers: { 'X-OnlyOne-Token': TOKEN } })
+  if (!res.ok) throw new Error(String(res.status))
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `onlyone-${scope}.${format === 'md' ? 'md' : format === 'html' ? 'html' : 'zip'}`
+  a.click()
+  URL.revokeObjectURL(url)
+  message.success('已交给浏览器下载，请到「下载」文件夹查看')
+}
+
+/**
+ * 导出：桌面端弹系统「另存为」，由后端写盘并返回真实路径。
+ * pywebview 的 ALLOW_DOWNLOADS 默认关闭，前端 <a download> 在窗口里点了没有反应，
+ * 所以桌面模式必须走 /api/notes/export/save；该接口在浏览器模式下返回 409 → 回退下载。
+ */
+async function exportTo(scope: 'page' | 'section' | 'notebook', format: 'md' | 'html' | 'zip') {
+  const id = exportTarget(scope)
   if (!id) { message.warning('请先选择一个页面'); return }
   try {
-    const res = await fetch(
-      `/api/notes/export?scope=${scope}&id=${id}&format=${format}`,
-      { headers: { 'X-OnlyOne-Token': TOKEN } })
-    if (!res.ok) throw new Error(String(res.status))
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `onlyone-${scope}.${format === 'md' ? 'md' : format === 'html' ? 'html' : 'zip'}`
-    a.click()
-    URL.revokeObjectURL(url)
-    message.success(format === 'zip' ? '已导出 HTML + 图片 zip' : '已导出')
+    const res = await fetch('/api/notes/export/save', {
+      method: 'POST',
+      headers: { 'X-OnlyOne-Token': TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope, id, format }),
+    })
+    if (res.status === 409) {
+      await downloadViaBrowser(scope, id, format)
+      return
+    }
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
+    const data = await res.json() as { saved: string | null; canceled?: boolean; size?: number }
+    if (data.canceled || !data.saved) return
+    message.success(
+      `已保存：${data.saved}（${((data.size || 0) / 1024).toFixed(0)} KB）`,
+      { duration: 8000 })
   } catch (e) {
-    message.error('导出失败：' + String(e))
+    const msg = String(e)
+    // WebView2 调用系统对话框失败时退回浏览器下载，至少不丢功能
+    if (msg.includes('500')) {
+      try { await downloadViaBrowser(scope, id, format); return } catch { /* 继续报错 */ }
+    }
+    message.error('导出失败：' + msg)
   }
 }
 
@@ -846,11 +1083,16 @@ onBeforeUnmount(() => {
       <div ref="tabsEl" class="tabs">
         <button
           v-for="s in visibleSections" :key="s.id" class="tab"
-          :class="{ active: s.id === activeSectionId }"
-          :title="`${s.name} · 双击改名 · 右键删除`"
+          :class="{ active: s.id === activeSectionId, 'drop-target': dropSectionId === s.id }"
+          :title="`${s.name} · 双击改名 · 右键删除 · 拖动调整顺序`"
+          draggable="true"
           @click="selectSection(s.id)"
           @dblclick.stop="startRenameSection(s)"
           @contextmenu.prevent="onSectionContext($event, s)"
+          @dragstart="onSectionDragStart(s, $event)"
+          @dragover="onSectionDragOver(s, $event)"
+          @drop="onSectionDrop(s, $event)"
+          @dragend="onDragEnd"
         >
           <input
             v-if="renamingSectionId === s.id"
@@ -869,7 +1111,7 @@ onBeforeUnmount(() => {
           trigger="click"
           @select="onMoreSelect"
         >
-          <button class="tab tab-more">更多 ▾</button>
+          <button class="tab tab-more" title="更多分区">⋯</button>
         </n-dropdown>
         <span v-if="!books.length" class="muted">还没有笔记本，点 ⋯ 新建</span>
         <span v-else-if="activeBook && !allSections.length" class="muted">还没有分区</span>
@@ -877,13 +1119,12 @@ onBeforeUnmount(() => {
 
       <n-dropdown
         v-model:show="importMenuShow"
-        :options="importMenuOptions"
+        :options="fileMenuOptions"
         trigger="click"
-        @select="onImportMenuSelect"
+        @select="onFileMenuSelect"
       >
-        <n-button size="tiny" quaternary :disabled="!activeBookId || importing"
-                  title="从 OneNote 导出的 .mht 批量导入">
-          {{ importing ? '导入中' : '导入' }}
+        <n-button size="tiny" quaternary title="导入 / 导出 / 备份">
+          {{ importing ? '导入中…' : '更多 ▾' }}
         </n-button>
       </n-dropdown>
       <n-button v-if="activeBook" size="tiny" quaternary
@@ -913,9 +1154,14 @@ onBeforeUnmount(() => {
         <div class="page-list">
           <div
             v-for="n in pageList" :key="n.id" class="note-row"
-            :class="{ active: activeId === n.id }"
+            :class="{ active: activeId === n.id, 'drop-target': dropNoteId === n.id }"
+            draggable="true"
             @click="openNote(n.id)"
             @contextmenu="onNoteContext($event, n)"
+            @dragstart="onNoteDragStart(n, $event)"
+            @dragover="onNoteDragOver(n, $event)"
+            @drop="onNoteDrop(n, $event)"
+            @dragend="onDragEnd"
           >
             <span class="grow ellipsis">{{ n.title || '未命名页面' }}</span>
             <n-tag v-if="n.is_private" size="tiny" :bordered="false">私密</n-tag>
@@ -968,14 +1214,6 @@ onBeforeUnmount(() => {
           </span>
         </div>
         <editor-content :editor="editor" class="tiptap" />
-        <div class="row export-row">
-          <n-button size="tiny" @click="download('page', 'md')">导出本页 MD</n-button>
-          <n-button size="tiny" @click="download('page', 'zip')">导出本页 HTML+图片</n-button>
-          <n-button size="tiny" @click="download('section', 'zip')">导出分区</n-button>
-          <n-button size="tiny" @click="download('notebook', 'zip')">导出笔记本</n-button>
-          <div class="grow" />
-          <n-button size="tiny" type="primary" @click="backup">全库备份</n-button>
-        </div>
       </template>
     </section>
     </div>
@@ -987,6 +1225,20 @@ onBeforeUnmount(() => {
       </button>
     </div>
   </div>
+
+  <n-modal v-model:show="showRowHeight" preset="card" title="表格行高" style="width: 300px">
+    <div class="row" style="gap: 8px; align-items: center">
+      <n-input-number v-model:value="rowHeightValue" :min="18" :max="400" :step="2"
+                      size="small" style="width: 130px" />
+      <span class="muted">px（18–400，整表生效）</span>
+    </div>
+    <template #footer>
+      <div class="row" style="justify-content: flex-end; gap: 8px">
+        <n-button size="small" @click="showRowHeight = false">取消</n-button>
+        <n-button size="small" type="primary" @click="applyRowHeight">应用</n-button>
+      </div>
+    </template>
+  </n-modal>
 
   <n-modal v-model:show="showDialog" preset="card" style="width: 400px"
            :title="dialogMode === 'book' ? '笔记本' : '分区'">
@@ -1087,6 +1339,8 @@ onBeforeUnmount(() => {
 .import-warn { margin-top: 6px; font-size: 12px; line-height: 1.65; color: var(--danger); }
 .note-row:hover { background: var(--paper-2); }
 .note-row.active { background: var(--accent-soft); color: var(--accent-strong); font-weight: 500; }
+/* 拖拽排序的落点提示：分区页签与页面行共用 */
+.tab.drop-target, .note-row.drop-target { outline: 2px dashed var(--accent); outline-offset: 1px; }
 .toolbar { margin: 10px 0; gap: 5px; flex-wrap: wrap; }
 .image-btn { font-size: 12px; color: var(--info-deep); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px 8px; cursor: pointer; }
 .tiptap { flex: 1 1 auto; min-height: 0; border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius-sm); padding: 20px 24px; overflow-y: auto; }
@@ -1117,6 +1371,20 @@ onBeforeUnmount(() => {
   word-break: break-word;
 }
 .tiptap :deep(th) { background: var(--paper-3); font-weight: 600; text-align: left; }
+/* 行高（整表）：由 table 节点的 rowHeight 属性渲染成 --row-h；未设置时回到自然高度 */
+.tiptap :deep(table td), .tiptap :deep(table th) { height: var(--row-h, auto); }
+/* 列宽拖拽手柄（Tiptap table resizable）：贴在列边界上的细条 + 拖拽光标 */
+.tiptap :deep(.column-resize-handle) {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--accent);
+  opacity: .55;
+  pointer-events: none;
+}
+.tiptap :deep(.resize-cursor) { cursor: col-resize; }
 .tiptap :deep(th p), .tiptap :deep(td p) { margin: 0; }
 /* 多单元格框选高亮（prosemirror-tables 的 selectedCell） */
 .tiptap :deep(.selectedCell)::after {
@@ -1132,5 +1400,4 @@ onBeforeUnmount(() => {
   outline-offset: 2px;
   border-radius: 4px;
 }
-.export-row { margin-top: 10px; gap: 6px; flex-wrap: wrap; }
 </style>

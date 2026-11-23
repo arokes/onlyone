@@ -172,13 +172,24 @@ function openCreate() {
   showModal.value = true
 }
 
-/** 行级动作收进「更多」菜单：工具栏一屏最多 3 个次级按钮 + 1 个主按钮（规范 §8.7） */
-const rowMenu = [
-  { label: '复制账号', key: 'username' },
-  { label: '复制密码', key: 'password' },
-  { label: '编辑', key: 'edit' },
-]
+/** 工具栏一屏最多 3 个次级按钮 + 1 个主按钮（规范 §8.7）：
+ *  行级动作（复制账号 / 复制密码 / 编辑）与库级动作（加密导出 / 从文件恢复）都收进「更多」。 */
+// 「更多」同时放行操作与库级操作：行操作需选中行，导出/恢复始终可用，
+// 因此不再整体禁用菜单，改为逐项 disabled。
+const rowMenu = computed(() => {
+  const has = !!selectedRow.value
+  return [
+    { label: '复制账号', key: 'username', disabled: !has },
+    { label: '复制密码', key: 'password', disabled: !has },
+    { label: '编辑', key: 'edit', disabled: !has },
+    { type: 'divider', key: 'divider' },
+    { label: '加密导出凭据…', key: 'export' },
+    { label: '从加密文件恢复…', key: 'import' },
+  ]
+})
 function onRowMenu(key: string) {
+  if (key === 'export') { showExport.value = true; return }
+  if (key === 'import') { showImport.value = true; return }
   const row = selectedRow.value
   if (!row) return
   if (key === 'edit') { openEdit(row); return }
@@ -570,21 +581,18 @@ onUnmounted(() => {
     <div class="row" style="margin-bottom: 10px">
       <h3 class="section-title">SAP 连接设置</h3>
       <div class="grow" />
-      <span class="muted">识别到 {{ sapCfg?.systems ?? 0 }} 个连接项</span>
       <n-button size="small" @click="loadSapConfig">刷新状态</n-button>
     </div>
     <div class="sap-line">
       <span class="sap-key">SAP GUI 目录</span>
-      <n-input v-model:value="sapGuiInput" size="small"
-               placeholder="留空 = 自动探测（…\SAP\FrontEnd\SAPgui）" />
+      <n-input v-model:value="sapGuiInput" size="small" placeholder="自动探测" />
       <n-button size="small" @click="pickSapDir">选择文件夹…</n-button>
       <n-button size="small" type="primary" :loading="sapSaving" @click="saveSapConfig">保存</n-button>
       <n-button size="small" quaternary @click="resetSapConfig">自动探测</n-button>
     </div>
     <div class="sap-line" style="margin-top: 8px">
       <span class="sap-key">Landscape XML</span>
-      <n-input v-model:value="sapLandInput" size="small"
-               placeholder="留空 = %APPDATA%\SAP\Common\SAPUILandscape.xml（可选）" />
+      <n-input v-model:value="sapLandInput" size="small" placeholder="可选" />
     </div>
     <div class="row" style="margin-top: 10px; flex-wrap: wrap; gap: 8px">
       <span class="muted">探测结果：</span>
@@ -599,25 +607,6 @@ onUnmounted(() => {
       </span>
       <span class="muted">{{ sapCfg?.landscape_xml }}</span>
     </div>
-    <div class="muted" style="margin-top: 8px">
-      SAP GUI 8.00 起，启动参数必须用 SAP Logon 里的「连接项名称」（如 DS4-100ZH），
-      旧版传 SID 会静默失败。目录或配置文件位置变化时在上面重新选择即可，无需改代码；
-      启动后会校验会话窗口是否真的出现，并把 SAP 窗口置前。
-    </div>
-  </div>
-
-  <div class="card" style="margin-top: 14px">
-    <h3 class="section-title" style="margin-bottom: 8px">导出 / 恢复（口令加密，可跨机迁移）</h3>
-    <div class="muted">
-      导出文件只含密文（Scrypt + AES-GCM），明文不落盘、不写日志；恢复时用当前 Windows 账户的 DPAPI
-      重新加密，因此换机器也能用。日常使用仍然免主口令，口令只在导出 / 恢复时使用。
-    </div>
-    <div class="row" style="margin-top: 10px; gap: 8px">
-      <n-button size="small" @click="showExport = true">加密导出凭据</n-button>
-      <n-button size="small" @click="showImport = true">从加密文件恢复</n-button>
-      <div class="grow" />
-      <span class="muted">全库备份（记事本页）也会包含凭据密文</span>
-    </div>
   </div>
 
   <div class="card" style="margin-top: 14px">
@@ -628,8 +617,8 @@ onUnmounted(() => {
       <n-button size="small" quaternary @click="load">刷新</n-button>
       <n-button size="small" :disabled="!selectedRow" @click="openUrl(selectedRow!)">打开链接</n-button>
       <n-button size="small" :loading="sapOpening" @click="openSap">启动 SAP</n-button>
-      <n-dropdown :options="rowMenu" trigger="click" :disabled="!selectedRow" @select="onRowMenu">
-        <n-button size="small" :disabled="!selectedRow">更多 ▾</n-button>
+      <n-dropdown :options="rowMenu" trigger="click" @select="onRowMenu">
+        <n-button size="small">更多 ▾</n-button>
       </n-dropdown>
       <n-button size="small" quaternary type="error" :disabled="!selectedRow"
                 @click="remove(selectedRow!)">

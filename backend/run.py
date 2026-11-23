@@ -33,6 +33,7 @@ if getattr(sys, "frozen", False):
     os.environ.setdefault("ONLYONE_BASE_DIR", str(Path(sys.executable).resolve().parent))
 
 import uvicorn  # noqa: E402
+from onlyone import desktop  # noqa: E402
 from onlyone.app import TOKEN_ENV, create_app  # noqa: E402
 from onlyone.db import DATA_DIR  # noqa: E402
 
@@ -171,8 +172,23 @@ def main() -> None:
             try:
                 import webview
 
+                # 兜底：pywebview 默认禁止下载（ALLOW_DOWNLOADS=False），WebView2 会直接丢弃
+                # <a download>。导出主路径是后端「另存为」，但若对话框在个别环境不可用，
+                # 前端会回退到浏览器下载——不放开这一项，回退同样会静默失败。
+                webview.settings['ALLOW_DOWNLOADS'] = True
+
                 window = webview.create_window(
                     WINDOW_TITLE, url, width=1280, height=800, min_size=(960, 600))
+
+                def _save_dialog(suggested: str) -> str | None:
+                    """导出时弹系统「另存为」：WebView2 默认禁下载，必须由后端写盘。"""
+                    result = window.create_file_dialog(
+                        webview.SAVE_DIALOG, save_filename=suggested)
+                    if not result:
+                        return None
+                    return result[0] if isinstance(result, (list, tuple)) else str(result)
+
+                desktop.set_save_dialog(_save_dialog)
 
                 def _on_closing(*_args) -> None:
                     server.should_exit = True

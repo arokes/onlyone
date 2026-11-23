@@ -60,7 +60,9 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
         page_count = conn.execute("PRAGMA page_count").fetchone()[0]
         free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
-        fts_rows = conn.execute("SELECT count(*) FROM fts_entries").fetchone()[0]
+        fts_rows = conn.execute(
+            "SELECT count(DISTINCT entry_id) FROM fts_entries").fetchone()[0]
+        fts_chunks = conn.execute("SELECT count(*) FROM fts_entries").fetchone()[0]
         semantic_rows = conn.execute("SELECT count(*) FROM semantic_index").fetchone()[0]
     finally:
         if own:
@@ -74,6 +76,7 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
         "free_pages": free_pages,
         "free_ratio": round(free / total, 3) if total else 0.0,
         "entries": fts_rows,
+        "fts_chunks": fts_chunks,
         "semantic_rows": semantic_rows,
     }
 

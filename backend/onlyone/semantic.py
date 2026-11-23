@@ -44,6 +44,9 @@ for _group in SYNONYM_GROUPS:
 MIN_SCORE = 0.15
 MAX_SEMANTIC_RESULTS = 20
 SYNONYM_WEIGHT = 3.0
+# 词袋向量对超长正文不敏感，但向量 JSON 会线性膨胀（实测 34.7 万字 → 31KB）。
+# 正文分片索引后单文件可达数百万字，这里只取前 400k 参与向量化，控制 semantic_index 体积。
+SEMANTIC_MAX_CHARS = 400_000
 
 
 def _tokens(text: str) -> list[str]:
@@ -69,7 +72,8 @@ def embed(text: str) -> dict[str, float]:
 def sync_entry(conn: sqlite3.Connection, entry_id: int,
                title: str, body: str) -> None:
     """条目写入 / 更新时同步向量（标题加权 ×2）。"""
-    vector = embed("%s %s\n%s" % (title or "", title or "", body or ""))
+    text = (body or "")[:SEMANTIC_MAX_CHARS]
+    vector = embed("%s %s\n%s" % (title or "", title or "", text))
     conn.execute(
         """INSERT INTO semantic_index(entry_id,vector,updated_at)
            VALUES(?,?,datetime('now','localtime'))

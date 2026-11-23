@@ -9,6 +9,8 @@ import { defineStore } from 'pinia'
 export interface SearchItem {
   id: number
   type: string
+  /** 业务记录/记事本条目的来源行 id：type='note' 时即 notes.id，用于跳转 */
+  ref_id?: number
   title: string
   summary: string
   snippet: string

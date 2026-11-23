@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import semantic
-from .extractor import SUPPORTED_EXTS, extract, wps_session
+from .extractor import SUPPORTED_EXTS, chunk_text, extract, wps_session
 
 log = logging.getLogger("onlyone")
 
@@ -139,7 +139,11 @@ def _sha256(path: Path) -> str:
 
 
 def _sync_entry(conn, file_id: int, name: str, body: str = "") -> int:
-    """写入/更新统一条目，并把 title + 正文写入 FTS（凭据文件不会调用本函数）。"""
+    """写入/更新统一条目，并把 title + 正文写入 FTS（凭据文件不会调用本函数）。
+
+    正文按 ``chunk_text`` 分片成多行（每条 ≤ CHUNK_CHARS，共用同一 entry_id）：
+    单个文件因此不再受单条正文上限限制，检索侧按 entry_id 去重并汇总命中次数。
+    """
     summary = " ".join((body or "").split())[:200]
     row = conn.execute(
         "SELECT id FROM entries WHERE type='file' AND ref_id=?", (file_id,)
@@ -157,8 +161,11 @@ def _sync_entry(conn, file_id: int, name: str, body: str = "") -> int:
             (file_id, name, summary),
         ).lastrowid
     conn.execute("DELETE FROM fts_entries WHERE entry_id=?", (eid,))
-    conn.execute("INSERT INTO fts_entries(entry_id,title,body,tags) VALUES(?,?,?,'')",
-                 (eid, name, body or name))
+    chunks = chunk_text(body or name) or [name]
+    conn.executemany(
+        "INSERT INTO fts_entries(entry_id,title,body,tags) VALUES(?,?,?,'')",
+        [(eid, name, chunk) for chunk in chunks],
+    )
     semantic.sync_entry(conn, eid, name, body)
     return eid
 

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- OnlyOne 应用图标 · 主稿（48 / 64 / 128 / 256）
+       O：扁椭圆 rx208 ry222（宽高比 0.94）
+       1：独立竖笔，与 O 外缘留 45 缝，顶端一个橙点作起笔
+       两者分离而非连写：连写会与小写 a 同形，分离后 16px 仍是"圆 + 竖 + 点"
+       暖纸 #f4eee2 / 墨蓝 #1f3040 / 陶土橙 #bf5a36，圆角 22% -->
+  <rect x="0" y="0" width="1024" height="1024" rx="225" fill="#f4eee2"/>
+  <ellipse cx="454" cy="512" rx="208" ry="222" fill="none" stroke="#1f3040" stroke-width="80"/>
+  <rect x="747" y="262" width="72" height="520" rx="36" fill="#1f3040"/>
+  <circle cx="783" cy="228" r="50" fill="#bf5a36"/>
+</svg>

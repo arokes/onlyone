@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- OnlyOne 图标 · 小尺寸特调（16 / 20 / 24px）
+       缝收到 30、笔画再加重，橙点放到最大 —— 16px 下只剩 3 个像素的信息量，
+       所以三者的间距必须靠"加粗 + 收紧"换出来，而不是等比缩小 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="225" fill="#f4eee2"/>
+  <ellipse cx="441" cy="512" rx="208" ry="222" fill="none" stroke="#1f3040" stroke-width="116"/>
+  <rect x="737" y="248" width="112" height="548" rx="56" fill="#1f3040"/>
+  <circle cx="793" cy="210" r="64" fill="#bf5a36"/>
+</svg>

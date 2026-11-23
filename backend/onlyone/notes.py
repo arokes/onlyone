@@ -30,7 +30,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from . import entries, mht_import, semantic
+from . import desktop, entries, mht_import, semantic
 from .db import DATA_DIR, DB_PATH, connect
 
 log = logging.getLogger("onlyone")
@@ -473,9 +473,13 @@ def create_section(body: SectionIn):
         if not conn.execute("SELECT 1 FROM notebooks WHERE id=?",
                             (body.notebook_id,)).fetchone():
             raise HTTPException(404, "笔记本不存在")
+        # sort_order 由前端拖拽排序写入；新建时缺省排到末尾，避免全部挤在 0 上
+        order = body.sort_order if body.sort_order > 0 else conn.execute(
+            "SELECT COALESCE(MAX(sort_order),0)+1 FROM sections WHERE notebook_id=?",
+            (body.notebook_id,)).fetchone()[0]
         sid = conn.execute(
             "INSERT INTO sections(notebook_id,name,sort_order) VALUES(?,?,?)",
-            (body.notebook_id, name, body.sort_order)).lastrowid
+            (body.notebook_id, name, order)).lastrowid
         conn.commit()
         return {"id": sid, "name": name}
     finally:
@@ -520,46 +524,63 @@ def delete_section(section_id: int):
 
 # ---------------------------------------------------------------- 导出（放在 /{note_id} 之前）
 
-@router.get("/api/notes/export")
-def export_notes(scope: str = "page", id: int = 0, format: str = "md"):
-    """导出单页 / 分区 / 笔记本。format=md | html | zip（html + 图片打包）。"""
-    if scope not in ("page", "section", "notebook") or format not in ("md", "html", "zip"):
+_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+
+def _pretty_name(raw: str, ext: str) -> str:
+    """「另存为」用的建议文件名：去 Windows 非法字符 + 补日期。"""
+    base = _UNSAFE_NAME.sub("_", (raw or "").strip()).strip(" .")[:80] or "onlyone"
+    return "%s-%s.%s" % (base, datetime.now().strftime("%Y%m%d"), ext)
+
+
+def _export_payload(scope: str, ident: int, fmt: str
+                    ) -> tuple[bytes, str, str, str]:
+    """构造导出内容，返回 ``(字节, media_type, ASCII 文件名, 建议文件名)``。
+
+    HTTP 头的文件名只能是 latin-1，所以浏览器下载仍用 ``note-3.md`` 这类 ASCII 名；
+    桌面端另存为用 ``_pretty_name`` 带中文标题，用户看得懂。
+    """
+    if scope not in ("page", "section", "notebook") or fmt not in ("md", "html", "zip"):
         raise HTTPException(400, "scope / format 不合法")
     conn = connect()
     try:
         if scope == "page":
             rows = [dict(r) for r in conn.execute(
-                "SELECT * FROM notes WHERE id=?", (id,))]
-            # HTTP 头只能 latin-1，文件名必须用 ASCII；中文标题在导出内容里保留
-            label = "note-%d" % id
+                "SELECT * FROM notes WHERE id=?", (ident,))]
+            label = "note-%d" % ident
+            row = conn.execute("SELECT title FROM notes WHERE id=?", (ident,)).fetchone()
+            display = row["title"] if row else label
         elif scope == "section":
             rows = [dict(r) for r in conn.execute(
-                "SELECT * FROM notes WHERE section_id=? ORDER BY sort_order,id", (id,))]
-            label = "section-%s" % id
+                "SELECT * FROM notes WHERE section_id=? ORDER BY sort_order,id", (ident,))]
+            label = "section-%s" % ident
+            row = conn.execute("SELECT name FROM sections WHERE id=?", (ident,)).fetchone()
+            display = row["name"] if row else label
         else:
             rows = [dict(r) for r in conn.execute(
                 """SELECT n.* FROM notes n JOIN sections s ON n.section_id=s.id
-                   WHERE s.notebook_id=? ORDER BY s.sort_order, n.sort_order, n.id""", (id,))]
-            label = "notebook-%s" % id
+                   WHERE s.notebook_id=? ORDER BY s.sort_order, n.sort_order, n.id""", (ident,))]
+            label = "notebook-%s" % ident
+            row = conn.execute("SELECT name FROM notebooks WHERE id=?", (ident,)).fetchone()
+            display = row["name"] if row else label
     finally:
         conn.close()
     if not rows:
         raise HTTPException(404, "该范围没有页面")
 
-    if format == "md":
+    if fmt == "md":
         text = "\n\n---\n\n".join(
             _to_markdown(r["title"], r["content_json"]) for r in rows)
-        return Response(
-            text, media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="%s.md"' % label})
+        return (text.encode("utf-8"), "text/markdown; charset=utf-8",
+                label + ".md", _pretty_name(display, "md"))
 
     html_doc = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">" \
                "<title>%s</title></head><body>%s</body></html>" % (
-                   html.escape(label),
+                   html.escape(display),
                    "".join(_to_html(r["title"], r["content_json"]) for r in rows))
-    if format == "html":
-        return Response(html_doc, media_type="text/html; charset=utf-8",
-                        headers={"Content-Disposition": 'attachment; filename="%s.html"' % label})
+    if fmt == "html":
+        return (html_doc.encode("utf-8"), "text/html; charset=utf-8",
+                label + ".html", _pretty_name(display, "html"))
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -571,10 +592,46 @@ def export_notes(scope: str = "page", id: int = 0, format: str = "md"):
             for image in folder.iterdir():
                 if image.is_file():
                     archive.write(str(image), "attachments/%s/%s" % (row["id"], image.name))
-    buffer.seek(0)
-    return Response(
-        buffer.getvalue(), media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="%s.zip"' % label})
+    return (buffer.getvalue(), "application/zip",
+            label + ".zip", _pretty_name(display, "zip"))
+
+
+@router.get("/api/notes/export")
+def export_notes(scope: str = "page", id: int = 0, format: str = "md"):
+    """浏览器模式导出（HTTP 直接回字节）。桌面端请用 /api/notes/export/save。"""
+    data, media_type, ascii_name, _ = _export_payload(scope, id, format)
+    return Response(data, media_type=media_type,
+                    headers={"Content-Disposition": 'attachment; filename="%s"' % ascii_name})
+
+
+class ExportSaveIn(BaseModel):
+    scope: str = "page"
+    format: str = "md"
+    id: int = 0
+
+
+@router.post("/api/notes/export/save")
+def export_notes_save(body: ExportSaveIn):
+    """桌面端导出：弹系统「另存为」→ 后端写盘 → 返回真实路径。
+
+    pywebview 默认禁止下载（``ALLOW_DOWNLOADS=False``），前端 ``<a download>``
+    在窗口里点了没有任何反应；这里改成后端写盘，路径由用户自己选。
+    没有桌面壳（浏览器模式 / --no-window）时返回 409，前端回退到 HTTP 下载。
+    """
+    if not desktop.has_save_dialog():
+        raise HTTPException(409, "当前运行模式不支持另存为对话框，请改用下载接口")
+    data, _, _, suggested = _export_payload(body.scope, body.id, body.format)
+    target = desktop.ask_save_path(suggested)
+    if not target:
+        return {"saved": None, "canceled": True}
+    path = Path(target)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as exc:
+        raise HTTPException(500, "写入失败：%s" % exc) from exc
+    log.info("导出完成 %s（%d 字节）", path, len(data))
+    return {"saved": str(path), "size": len(data), "canceled": False}
 
 
 # ---------------------------------------------------------------- OneNote 导入
@@ -711,8 +768,9 @@ def import_mht(body: MhtImportIn):
             first_note_id: int | None = None
             for title, doc in pages:
                 note_id = conn.execute(
-                    "INSERT INTO notes(section_id,title) VALUES(?,?)",
-                    (section_id, title)).lastrowid
+                    "INSERT INTO notes(section_id,title,sort_order) VALUES(?,?, "
+                    "(SELECT COALESCE(MAX(sort_order),0)+1 FROM notes WHERE section_id=?))",
+                    (section_id, title, section_id)).lastrowid
                 if first_note_id is None:
                     first_note_id = int(note_id)
                 doc, uploaded, miss = _materialize_images(note_id, doc, images)
@@ -762,9 +820,10 @@ def create_note(body: NoteCreate):
                             (body.section_id,)).fetchone():
             raise HTTPException(404, "分区不存在")
         nid = conn.execute(
-            "INSERT INTO notes(section_id,title,project_id) VALUES(?,?,?)",
+            "INSERT INTO notes(section_id,title,project_id,sort_order) VALUES(?,?,?, "
+            "(SELECT COALESCE(MAX(sort_order),0)+1 FROM notes WHERE section_id=?))",
             (body.section_id, body.title.strip() or "未命名页面",
-             body.project_id)).lastrowid
+             body.project_id, body.section_id)).lastrowid
         row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
         _sync_note_entry(conn, row)
         conn.commit()

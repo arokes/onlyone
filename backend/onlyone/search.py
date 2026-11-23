@@ -18,29 +18,50 @@ import sqlite3
 log = logging.getLogger("onlyone")
 
 
+# 正文分片后同一个文件可能占多行，SQL 先多取再按 entry_id 去重，避免一个文件挤占全部名额。
+_FETCH_ROWS = 900
+_MAX_RESULTS = 300
+
+
+def _dedupe(ids) -> list[int]:
+    seen: set[int] = set()
+    out: list[int] = []
+    for eid in ids:
+        if eid in seen:
+            continue
+        seen.add(eid)
+        out.append(eid)
+        if len(out) >= _MAX_RESULTS:
+            break
+    return out
+
+
 def search_entries(conn: sqlite3.Connection, q: str) -> tuple[str, list[int]]:
     """返回 ``(mode, entry_ids)``。
 
     FTS5 trigram 对两字中文词返回 0（本机实测），因此：
     >=3 字符走 trigram；短词或 trigram 零命中时降级为 title/body/tags 的 LIKE 扫描。
+    一个条目可能有多条分片行，结果按 entry_id 去重（保留首次出现顺序）。
     """
     ids: list[int] = []
     if len(q) >= 3:
         phrase = '"' + q.replace('"', '""') + '"'
         try:
             ids = [r[0] for r in conn.execute(
-                "SELECT entry_id FROM fts_entries WHERE fts_entries MATCH ? LIMIT 300",
-                (phrase,))]
+                "SELECT entry_id FROM fts_entries WHERE fts_entries MATCH ? LIMIT ?",
+                (phrase, _FETCH_ROWS))]
         except Exception as exc:  # noqa: BLE001 - 查询语法异常时降级
             log.warning("FTS5 查询降级 %r: %s", q, exc)
+    ids = _dedupe(ids)
     if ids:
         return "fts5_trigram", ids
 
     pat = "%" + q + "%"
-    ids = [r[0] for r in conn.execute(
-        "SELECT entry_id FROM fts_entries "
-        "WHERE title LIKE ? OR body LIKE ? OR tags LIKE ? LIMIT 300",
-        (pat, pat, pat))]
+    ids = _dedupe(
+        r[0] for r in conn.execute(
+            "SELECT entry_id FROM fts_entries "
+            "WHERE title LIKE ? OR body LIKE ? OR tags LIKE ? LIMIT ?",
+            (pat, pat, pat, _FETCH_ROWS)))
     return "like_fallback", ids
 
 

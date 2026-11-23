@@ -70,6 +70,12 @@ const ICON_PATHS: Record<string, string[]> = {
     'M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5',
   ],
   folder: ['M3 6h6l2 2h10v10.5H3z'],
+  note: [
+    'M6 3h8l4 4v14H6z',
+    'M14 3v4h4',
+    'M9 12h6',
+    'M9 16h4',
+  ],
   link: [
     'M10 14 14 10',
     'M8.6 12.4 6.2 14.8a3.4 3.4 0 0 0 4.8 4.8l2.4-2.4',
@@ -412,8 +418,16 @@ async function submitLink() {
 function sourceLabel(it: Item) {
   if (it.type === 'plugin') return it.source || '外部索引'
   if (it.type === 'link') return '企微链接'
+  if (it.type === 'note') return '记事本'
   if (it.type !== 'file') return '业务记录'
   return it.root_kind === 'anyshare_sync' ? '爱数同步盘' : '本地'
+}
+
+/** 记事本条目：跳到记事本页签并直接打开对应页面（jump store 由 NotesView 消费） */
+function openInNotes(it: Item) {
+  const noteId = Number(it.ref_id || 0)
+  if (!noteId) { message.warning('这条记录还没有对应的记事本页面'); return }
+  jump.jumpToNote(noteId)
 }
 
 function groupEyebrow(g: Group) {
@@ -567,6 +581,18 @@ onUnmounted(() => {
           {{ it.abs_path ?? (it.url || '—') }}
         </span>
         <div v-if="g.actions" class="actions">
+          <n-tooltip v-if="it.type === 'note'" trigger="hover">
+            <template #trigger>
+              <button class="icon-btn" type="button" aria-label="在记事本中打开"
+                      @click="openInNotes(it)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+                     stroke-linecap="round" stroke-linejoin="round">
+                  <path v-for="d in ICON_PATHS.note" :key="d" :d="d" />
+                </svg>
+              </button>
+            </template>
+            在记事本中打开
+          </n-tooltip>
           <n-tooltip trigger="hover">
             <template #trigger>
               <button class="icon-btn" type="button" aria-label="只读预览" @click="openPreview(it)">

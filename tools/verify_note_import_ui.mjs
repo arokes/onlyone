@@ -2,7 +2,7 @@
 /**
  * 记事本「导入 OneNote 分区」界面回归（CDP，零第三方依赖）。
  *
- * 覆盖：左侧树「导入」按钮存在 → 通过隐藏 input 选入 .mht → 后端建分区与页面 →
+ * 覆盖：顶部「更多」菜单含导入项 → 通过隐藏 input 选入 .mht → 后端建分区与页面 →
  * 结果弹窗显示统计 → 截图。自包含：不依赖 D:\1118 里的真实导出文件，
  * 内置一份最小 MHT 样本（1 页 + 1 张 1x1 PNG）。
  *
@@ -179,14 +179,23 @@ async function main() {
   await waitFor('记事本就绪', async () =>
     await evaluate(`!!document.querySelector('.tiptap-body, .notes-layout') && document.readyState === 'complete'`))
 
-  // 1) 「导入」按钮存在且可用（新布局在顶部固定条里）
+  // 1) 顶部「更多」按钮存在且可用，菜单里能点到导入项（2026-11-20：导入/导出合并进「更多」）
   const btnState = await evaluate(`(() => {
     const btn = [...document.querySelectorAll('.notes-topbar button')]
-      .find(b => b.textContent.trim().startsWith('导入'));
+      .find(b => b.textContent.trim().startsWith('更多'));
     if (!btn) return null;
+    btn.click();
     return { text: btn.textContent.trim(), disabled: btn.disabled };
   })()`)
-  check('左侧树存在「导入」按钮', !!btnState && !btnState.disabled, JSON.stringify(btnState))
+  await new Promise(r => setTimeout(r, 400))
+  const importItem = await evaluate(`(() => {
+    const item = [...document.querySelectorAll('.n-dropdown-option')]
+      .find(o => o.textContent.includes('导入 OneNote'));
+    return item ? item.textContent.trim() : null;
+  })()`)
+  check('顶部「更多」菜单含导入项', !!btnState && !btnState.disabled && !!importItem,
+        JSON.stringify({ btnState, importItem }))
+  await evaluate(`document.body.click(); true`)
 
   // 2) 通过隐藏 input 选入 MHT（等价于用户点选文件）
   const { root } = await cdp('DOM.getDocument', { depth: 2 })

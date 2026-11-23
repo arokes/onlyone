@@ -132,12 +132,30 @@ def _hit_count(text: str, q: str) -> int:
 
 
 def _items_by_ids(conn, ids: list[int], q: str) -> list[dict]:
-    """把 entry_id 列表组装成搜索结果项（字面 / 语义分组共用）。"""
+    """把 entry_id 列表组装成搜索结果项（字面 / 语义分组共用）。
+
+    正文是分片存的（一个条目可能有多行），因此这里按 entry_id 汇总：
+    命中次数跨分片累加，snippet 取第一条真正命中查询词的分片，
+    避免只看到最后一片、或命中数被低估。
+    """
     if not ids:
         return []
     marks = ",".join("?" for _ in ids)
-    bodies = {r["entry_id"]: r["body"] for r in conn.execute(
-        f"SELECT entry_id, body FROM fts_entries WHERE entry_id IN ({marks})", ids)}
+    terms = _query_terms(q)
+    snippets: dict[int, str] = {}
+    fallback: dict[int, str] = {}
+    hits: dict[int, int] = {}
+    for row in conn.execute(
+            f"SELECT entry_id, body FROM fts_entries WHERE entry_id IN ({marks}) ORDER BY rowid",
+            ids):
+        eid = row["entry_id"]
+        body = row["body"] or ""
+        hits[eid] = hits.get(eid, 0) + _hit_count(body, q)
+        if eid not in fallback:
+            fallback[eid] = body
+        if eid not in snippets and any(t in body.lower() for t in terms):
+            snippets[eid] = _snippet(body, q)
+
     rows = conn.execute(
         f"""SELECT e.*, f.abs_path, f.ext, f.extract_status, f.extract_error,
                    r.kind AS root_kind
@@ -146,12 +164,13 @@ def _items_by_ids(conn, ids: list[int], q: str) -> list[dict]:
             LEFT JOIN roots r ON r.id = f.root_id
             WHERE e.id IN ({marks}) ORDER BY e.updated_at DESC""", ids)
     items = []
-    terms = _query_terms(q)
     for row in rows:
         item = dict(row)
-        body = bodies.get(row["id"], "") or ""
-        item["snippet"] = _snippet(body or item.get("summary", "") or "", q)
-        item["hit_count"] = _hit_count(body, q)
+        body = snippets.get(row["id"]) or ""
+        if not body:
+            body = _snippet(fallback.get(row["id"], "") or item.get("summary", "") or "", q)
+        item["snippet"] = body
+        item["hit_count"] = hits.get(row["id"], 0)
         title_low = str(row["title"] or "").lower()
         item["hit_in_title"] = any(t in title_low for t in terms)
         items.append(item)
@@ -486,9 +505,15 @@ def create_app(token: str) -> FastAPI:
                 raise HTTPException(404, "条目不存在：%s" % entry_id)
             data = dict(row)
             allowed = _in_roots(conn, data["abs_path"]) if data["abs_path"] else False
-            fts = conn.execute("SELECT body FROM fts_entries WHERE entry_id=?",
-                               (data["id"],)).fetchone()
-            body_text = fts["body"] if fts else ""
+            # 正文分片存储：非文件条目（记事 / 业务记录）预览需按行序拼回整篇。
+            # 文件类型不走这里（下面会重新抽取以获得图片标记），避免无谓加载整篇正文。
+            body_text = ""
+            if data["type"] != "file":
+                fts = conn.execute(
+                    "SELECT group_concat(body, char(10)) AS body FROM "
+                    "(SELECT body FROM fts_entries WHERE entry_id=? ORDER BY rowid)",
+                    (data["id"],)).fetchone()
+                body_text = (fts["body"] or "") if fts else ""
         finally:
             conn.close()
 

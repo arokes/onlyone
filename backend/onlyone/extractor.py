@@ -33,12 +33,20 @@ from pathlib import Path
 
 log = logging.getLogger("onlyone")
 
-MAX_TEXT_CHARS = 200_000
-# 200k 而非 100k：一个 docx 里可能嵌着 16 个工作表的 Excel（实测单文件正文 13.3 万字），
-# 100k 会把尾部工作表整段截掉，导致「明明有却搜不到」。11 个含内嵌对象的文件总计多占约 1MB。
+MAX_TEXT_CHARS = 2_000_000
+# 2M 是「单文件正文总预算」，不再是单条索的上限：正文按 CHUNK_CHARS 分片写入同一条目的
+# 多行 fts_entries，检索按 entry_id 汇总，因此不再出现「截断即丢内容」。
+# 实测最大单文件 136.5 万字（ZPP044-185000021-VC.XLSX，3 表 × 2000 行 × 40 列）；
+# 200k 时本机有 43 个条目恰好卡在上限（用户角色权限（25年版）.xlsx 34.7 万字被截掉三张表）。
+CHUNK_CHARS = 200_000
 MAX_TABLE_ROWS = 2_000
 MAX_TABLE_COLS = 40
 MAX_TABLES = 20
+# 宽表溢出列上限：表格结构只保留前 MAX_TABLE_COLS 列（只读预览不易过宽），
+# 第 41 列之后的内容以纯文本行进正文，避免「一人一列」的权限矩阵整列丢失。
+# 256 而非 16384：openpyxl read_only 模式下部分工作簿的 dimension 虚高到 16384 列，
+# 不设上限会让每行多扫一万多个空单元格。
+WIDE_MAX_COLS = 256
 MAX_PDF_PAGES = 500
 
 # OOXML 命名空间：只为在预览里定位图片（a:blip / v:imagedata）而用
@@ -130,6 +138,52 @@ class ExtractResult:
 
 def _clip(text: str) -> str:
     return (text or "").strip()[:MAX_TEXT_CHARS]
+
+
+def chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
+    """把正文切成每片不超过 ``size`` 的若干段，优先在换行处断开。
+
+    分片写入同一条目的多行 ``fts_entries``，检索结果按 entry_id 汇总。
+    这样单文件不再受单条正文长度限制，同时又不会让单行过大拖慢 FTS 与向量化。
+    """
+    text = text or ""
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    chunks: list[str] = []
+    buf: list[str] = []
+    used = 0
+    for line in text.split("\n"):
+        # 无换行的超长单行（压缩 JSON / 单行 CSV）按 size 硬切
+        while len(line) > size:
+            if buf:
+                chunks.append("\n".join(buf))
+                buf, used = [], 0
+            chunks.append(line[:size])
+            line = line[size:]
+        if buf and used + len(line) + 1 > size:
+            chunks.append("\n".join(buf))
+            buf, used = [], 0
+        buf.append(line)
+        used += len(line) + 1
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
+def _wide_row_text(row) -> str:
+    """一行中第 MAX_TABLE_COLS 列之后的非空文本。
+
+    表格结构（只读预览）仍只保留前 40 列，但溢出列必须进正文：
+    权限矩阵类工作簿是「一人一列」，丢掉第 41 列之后等于整片人员搜不到。
+    """
+    if len(row) <= MAX_TABLE_COLS:
+        return ""
+    return " ".join(
+        s for s in (("" if v is None else str(v)).strip()
+                    for v in row[MAX_TABLE_COLS:WIDE_MAX_COLS]) if s
+    )
 
 
 def _docx_para_text(el, rel_map: dict[str, int]) -> str:
@@ -236,6 +290,10 @@ def _from_xlsx(path: Path) -> ExtractResult:
                 cells = ["" if v is None else str(v) for v in row[:MAX_TABLE_COLS]]
                 if any(c.strip() for c in cells):
                     rows.append(cells)
+                # 页宽超过 40 列时，溢出列以纯文本补进正文（不入表格结构）
+                extra = _wide_row_text(row)
+                if extra:
+                    lines.append(extra)
             if rows:
                 tables.append(rows)
             if len(tables) >= MAX_TABLES:
@@ -277,10 +335,15 @@ def _from_xls(path: Path) -> ExtractResult:
     tables: list[list[list[str]]] = []
     for sheet in book.sheets():
         lines.append("工作表：" + sheet.name)
-        rows = [
-            [str(sheet.cell_value(r, c)) for c in range(min(sheet.ncols, MAX_TABLE_COLS))]
-            for r in range(min(sheet.nrows, MAX_TABLE_ROWS))
-        ]
+        rows: list[list[str]] = []
+        for r in range(min(sheet.nrows, MAX_TABLE_ROWS)):
+            values = [sheet.cell_value(r, c)
+                      for c in range(min(sheet.ncols, WIDE_MAX_COLS))]
+            # 表格结构与改造前一致：不去空行，只补溢出列正文
+            rows.append([str(v) for v in values[:MAX_TABLE_COLS]])
+            extra = _wide_row_text(values)
+            if extra:
+                lines.append(extra)
         if rows:
             tables.append(rows)
         if len(tables) >= MAX_TABLES:
