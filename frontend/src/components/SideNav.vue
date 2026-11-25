@@ -16,7 +16,6 @@ const ICONS: Record<string, string[]> = {
   search: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z', 'M16.2 16.2 21 21'],
   notes: ['M6 3h8l4 4v14H6z', 'M14 3v4h4', 'M9 12h6', 'M9 16h6'],
   projects: ['M4 4h6v6H4z', 'M14 4h6v6h-6z', 'M4 14h6v6H4z', 'M14 14h6v6h-6z'],
-  worklogs: ['M5 6h14', 'M5 12h14', 'M5 18h9'],
   incidents: ['M12 4 3.5 19.5h17L12 4Z', 'M12 10v4.5', 'M12 17v.5'],
   links: ['M10 14 14 10',
     'M8.6 12.4 6.2 14.8a3.4 3.4 0 0 0 4.8 4.8l2.4-2.4',

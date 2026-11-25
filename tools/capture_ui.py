@@ -60,8 +60,7 @@ def purge() -> None:
             conn.execute("DELETE FROM files WHERE root_id=?", (rid,))
             conn.execute("DELETE FROM roots WHERE id=?", (rid,))
         for table, col in (("projects", "name"), ("links", "title"),
-                           ("worklogs", "content"), ("incidents", "system"),
-                           ("credentials", "title")):
+                           ("incidents", "system"), ("credentials", "title")):
             conn.execute(f"DELETE FROM {table} WHERE {col} LIKE ?", (PREFIX + "%",))
         # 笔记的 entries / fts / 语义向量没有外键，删笔记本前先手动清
         note_ids = [r[0] for r in conn.execute(
@@ -102,13 +101,18 @@ def seed(base: str, tmp: Path) -> int:
     http(base, "/api/biz/projects", "POST",
          {"data": {"name": PREFIX + "灾备系统升级",
                    "note": "灾备切换演练与数据库主从改造", "status": "active"}})
-    http(base, "/api/biz/worklogs", "POST",
-         {"data": {"log_date": "2026-11-06",
-                   "content": PREFIX + "完成灾备切换演练脚本评审", "minutes": 90}})
+    http(base, "/api/biz/incidents", "POST",
+         {"data": {"occurred_at": "2026-11-06 10:00", "system": PREFIX + "灾备平台",
+                   "proposer": "张工", "company": "信息中心",
+                   "symptom": PREFIX + "完成灾备切换演练脚本评审",
+                   "duration_min": 90, "status": "closed"}})
     # 近义演示：查询「宕机」时字面无命中，但语义分组应命中这条「服务不可用」
-    http(base, "/api/biz/worklogs", "POST",
-         {"data": {"log_date": "2026-11-06",
-                   "content": PREFIX + "服务不可用，需要立即处理", "minutes": 20}})
+    # （工作日志停用后，这段近义文本改由运维记录承载）
+    http(base, "/api/biz/incidents", "POST",
+         {"data": {"occurred_at": "2026-11-06 11:00", "system": PREFIX + "订单服务",
+                   "proposer": "李工", "company": "业务一部",
+                   "symptom": PREFIX + "服务不可用，需要立即处理",
+                   "duration_min": 20}})
     http(base, "/api/biz/incidents", "POST",
          {"data": {"occurred_at": "2026-11-05 21:30", "system": PREFIX + "数据库",
                    "symptom": "主从复制延迟告警", "root_cause": "磁盘 IO 饱和",
@@ -155,7 +159,7 @@ def cleanup(base: str, rid: int | None) -> None:
             http(base, "/api/roots/%d" % rid, "DELETE")
         except Exception:  # noqa: BLE001
             pass
-    for kind in ("worklogs", "incidents", "links", "projects"):
+    for kind in ("incidents", "links", "projects"):
         try:
             for row in http(base, "/api/biz/" + kind):
                 blob = json.dumps(row, ensure_ascii=False)

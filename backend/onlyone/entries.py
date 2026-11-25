@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import semantic
+from . import rich, semantic
 
 
 @dataclass(frozen=True)
@@ -36,16 +36,15 @@ ENTITIES: dict[str, Entity] = {
         columns=("title", "url", "project_id", "note"),
         body_fields=("url", "note"), date_field="last_check_at",
     ),
-    "worklogs": Entity(
-        table="worklogs", type="worklog", label="工作日志",
-        columns=("log_date", "project_id", "content", "minutes"),
-        body_fields=("content",), date_field="log_date",
-    ),
+    # 工作日志已于 2026-11-23 停用（撤界面 + 退出检索），不再登记为可写实体；
+    # worklogs 表的历史数据仍在库里，但不再有 entries / FTS 行。
     "incidents": Entity(
         table="incidents", type="incident", label="运维记录",
-        columns=("occurred_at", "system", "symptom", "root_cause",
-                 "action", "status", "duration_min", "project_id", "note"),
-        body_fields=("system", "symptom", "root_cause", "action", "note"),
+        columns=("occurred_at", "category", "system", "proposer", "company", "symptom",
+                 "root_cause", "action", "status", "duration_min", "project_id", "note"),
+        # category 进正文：全局搜索可直接按「BUG / 优化 / 业务方案」筛出同类记录。
+        body_fields=("category", "system", "proposer", "company", "symptom", "root_cause",
+                     "action", "note"),
         date_field="occurred_at", defaults={"status": "open"},
     ),
     # M7：只供 notes.py 复用统一条目同步；business.py 的通用 CRUD 会排除它
@@ -74,12 +73,10 @@ def _title(kind: str, row) -> str:
         return str(_get(row, "name")).strip() or "未命名项目"
     if kind == "links":
         return str(_get(row, "title")).strip() or "未命名链接"
-    if kind == "worklogs":
-        text = " ".join(str(_get(row, "content")).split())[:24]
-        return ("工作日志 %s %s" % (_get(row, "log_date"), text)).strip()
     if kind == "incidents":
         system = str(_get(row, "system")).strip() or "未分类系统"
-        symptom = " ".join(str(_get(row, "symptom")).split())[:30]
+        # symptom 现在是富文本列：标题取纯文本，否则会把 JSON 结构写进条目标题
+        symptom = " ".join(rich.extract_text(_get(row, "symptom")).split())[:30]
         return "%s · %s" % (system, symptom or "运维记录")
     if kind == "notes":
         return str(_get(row, "title")).strip() or "未命名页面"
@@ -87,9 +84,10 @@ def _title(kind: str, row) -> str:
 
 
 def make_body(kind: str, row) -> str:
+    """拼 FTS 正文。富文本列（运维记录四字段）先抽纯文本，图片 URL 与 JSON 结构不入索引。"""
     parts = []
     for col in ENTITIES[kind].body_fields:
-        value = str(_get(row, col)).strip()
+        value = rich.extract_text(_get(row, col)).strip()
         if value:
             parts.append(value)
     return "\n".join(parts)
@@ -148,7 +146,7 @@ def drop_entry(conn: sqlite3.Connection, kind: str, ref_id: int) -> None:
 
 def unlink_project(conn: sqlite3.Connection, project_id: int) -> None:
     """删除项目后，解除其余业务记录对它的引用并重同步条目，避免悬空 project_id。"""
-    for kind in ("links", "worklogs", "incidents"):
+    for kind in ("links", "incidents"):
         table = ENTITIES[kind].table
         ids = [r[0] for r in conn.execute(
             f"SELECT id FROM {table} WHERE project_id=?", (project_id,))]

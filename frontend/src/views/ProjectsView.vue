@@ -2,9 +2,11 @@
 /**
  * 项目事项（v0.9）：左侧项目列表 + 右侧项目工作台。
  *
- * 用户 2026-11-17 决定：四个页签（企微链接 / 运维记录 / 工作日志）+ 关联文件，
- * 不再用抽屉看关联条目。三类业务表本来就有 project_id；
+ * 用户 2026-11-17 决定：三个业务页签（企微链接 / 运维记录）+ 关联文件，
+ * 不再用抽屉看关联条目。业务表本来就有 project_id；
  * 关联文件仍来自搜索页「关联到项目」形成的 entry_relations。
+ *
+ * 2026-11-23 决定：**移除工作日志页签**（工作日志整体停用，见 App.vue 导航）。
  *
  * 2026-11-17 15:23 用户决定：**移除记事本页签**（只删 UI，notes.project_id
  * 与 /api/projects/{id}/notes 保留，已有归属页在「记事本 → 项目笔记」里照旧可看）。
@@ -15,6 +17,7 @@ import {
 } from 'naive-ui'
 import BizCrud from '@/components/BizCrud.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import { incidentCategoryOptions, incidentRowClass } from '@/components/incident-options'
 import { api } from '@/api/client'
 import { useJumpStore } from '@/stores/jump'
 import type { Field } from '@/components/biz-types'
@@ -37,7 +40,7 @@ interface FileRow {
 }
 interface Workspace {
   project: Project
-  counts: { links: number; worklogs: number; incidents: number; files: number }
+  counts: { links: number; incidents: number; files: number }
   previews: Record<string, unknown[]>
 }
 
@@ -51,36 +54,33 @@ const linkFields: Field[] = [
   { key: 'project_id', label: '归属项目', type: 'project', width: 150 },
   { key: 'note', label: '备注', type: 'textarea', hideInTable: true },
 ]
-const worklogFields: Field[] = [
-  { key: 'log_date', label: '日期', type: 'date', width: 130 },
-  { key: 'project_id', label: '归属项目', type: 'project', width: 150 },
-  { key: 'content', label: '内容', type: 'textarea' },
-  { key: 'minutes', label: '耗时(分)', type: 'number', width: 100 },
-]
 const incidentFields: Field[] = [
   { key: 'occurred_at', label: '发生时间', type: 'datetime', width: 160 },
+  { key: 'category', label: '类型', type: 'select', width: 100, options: incidentCategoryOptions },
   { key: 'system', label: '系统', width: 140 },
-  { key: 'symptom', label: '现象', type: 'textarea', width: 200 },
-  { key: 'root_cause', label: '根因', type: 'textarea', hideInTable: true },
-  { key: 'action', label: '处置', type: 'textarea', hideInTable: true },
+  { key: 'proposer', label: '提出人', width: 96 },
+  { key: 'company', label: '公司', width: 110 },
+  { key: 'symptom', label: '现象', type: 'rich', width: 170 },
+  { key: 'root_cause', label: '根因', type: 'rich', hideInTable: true },
+  { key: 'action', label: '处置', type: 'rich', hideInTable: true },
   {
     key: 'status', label: '状态', type: 'select', width: 100,
     options: [{ label: '未关闭', value: 'open' }, { label: '已关闭', value: 'closed' }],
   },
   { key: 'duration_min', label: '耗时(分)', type: 'number', width: 100 },
   { key: 'project_id', label: '归属项目', type: 'project', width: 140 },
-  { key: 'note', label: '备注', type: 'textarea', hideInTable: true },
+  { key: 'note', label: '备注', type: 'rich', hideInTable: true },
 ]
 
 const projects = ref<Project[]>([])
 const activeId = ref<number | null>(null)
 const keyword = ref('')
 const status = ref<'active' | 'archived' | 'all'>('active')
-const TABS = ['links', 'incidents', 'worklogs', 'files']
+const TABS = ['links', 'incidents', 'files']
 // ?ptab=files 直达某个页签（headless 截图与文档链接用）
 const ptab = new URLSearchParams(window.location.search).get('ptab')
 const tab = ref(ptab && TABS.includes(ptab) ? ptab : 'links')
-const counts = reactive({ links: 0, worklogs: 0, incidents: 0, files: 0 })
+const counts = reactive({ links: 0, incidents: 0, files: 0 })
 const projectEntryId = ref<number | null>(null)
 const files = ref<FileRow[]>([])
 const loadingFiles = ref(false)
@@ -111,7 +111,7 @@ async function loadProjects(keepActive = true) {
 
 async function loadWorkspace() {
   if (!activeId.value) {
-    Object.assign(counts, { links: 0, worklogs: 0, incidents: 0, files: 0 })
+    Object.assign(counts, { links: 0, incidents: 0, files: 0 })
     projectEntryId.value = null
     return
   }
@@ -256,9 +256,10 @@ async function openFile(row: FileRow) {
   }
 }
 
-function gotoSearch(entryId: number) {
+function gotoSearch(entryId: number, title?: string) {
   if (!entryId) return
-  jump.jumpToEntry(entryId)
+  // 带上文件名：关掉预览后搜索页能看到这组结果，而不是空搜索页
+  jump.jumpToEntry(entryId, title)
 }
 
 function fmtSize(size: number): string {
@@ -341,14 +342,8 @@ function shortTime(text: string): string {
           <template #tab>
             <span>运维记录<i v-if="counts.incidents" class="badge">{{ counts.incidents }}</i></span>
           </template>
-          <biz-crud kind="incidents" title="运维记录" :fields="incidentFields" :project-id="activeId" />
-        </n-tab-pane>
-
-        <n-tab-pane name="worklogs">
-          <template #tab>
-            <span>工作日志<i v-if="counts.worklogs" class="badge">{{ counts.worklogs }}</i></span>
-          </template>
-          <biz-crud kind="worklogs" title="工作日志" :fields="worklogFields" :project-id="activeId" />
+          <biz-crud kind="incidents" title="运维记录" :fields="incidentFields"
+                    :project-id="activeId" :row-class="incidentRowClass" />
         </n-tab-pane>
 
         <n-tab-pane name="files">
@@ -373,7 +368,7 @@ function shortTime(text: string): string {
               <span class="ellipsis" style="flex: 1">{{ f.title }}</span>
               <span class="muted">{{ fmtSize(f.size) }}</span>
               <n-button size="tiny" secondary @click="openFile(f)">打开</n-button>
-              <n-button size="tiny" quaternary @click="gotoSearch(f.entry_id)">查看</n-button>
+              <n-button size="tiny" quaternary @click="gotoSearch(f.entry_id, f.title)">查看</n-button>
             </div>
           </div>
         </n-tab-pane>
@@ -384,7 +379,7 @@ function shortTime(text: string): string {
       <div class="card">
         <empty-state
           title="还没有项目"
-          desc="项目是把企微链接、工作日志、运维记录和关联文件串起来的那根线。建一个，之后就能按项目回看全部上下文。"
+          desc="项目是把企微链接、运维记录和关联文件串起来的那根线。建一个，之后就能按项目回看全部上下文。"
           action-text="新建项目"
           hint="也可以先在别处录入记录，之后再归到项目下"
           @action="openCreateProject"

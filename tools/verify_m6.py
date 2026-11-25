@@ -86,7 +86,7 @@ def purge() -> None:
             conn.execute("DELETE FROM files WHERE root_id=?", (rid,))
             conn.execute("DELETE FROM roots WHERE id=?", (rid,))
         for table, col in (("projects", "name"), ("links", "title"),
-                           ("worklogs", "content"), ("incidents", "system")):
+                           ("incidents", "system")):
             conn.execute(f"DELETE FROM {table} WHERE {col} LIKE ?", (PREFIX + "%",))
         conn.commit()
     finally:
@@ -122,7 +122,7 @@ def main() -> int:
     results: list[bool] = []
     tmp: Path | None = None
     rid = None
-    log_id = None
+    inc_id = None
     plugin_proc = None
     try:
         if not wait_ready(base):
@@ -164,26 +164,28 @@ def main() -> int:
                              not any("密码" in str(i["title"]) for i in secret["items"])))
 
         # 3) 语义检索：字面无命中，但语义分组命中
-        log = http(base, "/api/biz/worklogs", "POST",
-                   {"data": {"log_date": "2026-11-06",
-                             "content": PREFIX + "服务不可用，需要立即处理", "minutes": 15}})
-        log_id = log["id"]
+        # 工作日志已停用（2026-11-23），语义命中改用运维记录承载同一段近义文本
+        inc = http(base, "/api/biz/incidents", "POST",
+                   {"data": {"occurred_at": "2026-11-06 09:00",
+                             "system": PREFIX + "订单服务",
+                             "symptom": PREFIX + "服务不可用，需要立即处理"}})
+        inc_id = inc["id"]
         sem_q = "/api/search?q=" + urllib.parse.quote("宕机")
         sem = http(base, sem_q)
-        literal_has = any(i["type"] == "worklog" and i["ref_id"] == log_id
+        literal_has = any(i["type"] == "incident" and i["ref_id"] == inc_id
                           for i in sem["items"])
-        semantic_has = any(i["type"] == "worklog" and i["ref_id"] == log_id
+        semantic_has = any(i["type"] == "incident" and i["ref_id"] == inc_id
                            for i in sem["semantic_items"])
         results.append(check("字面检索不含近义记录", not literal_has))
         results.append(check("语义分组命中近义记录", semantic_has,
                              "semantic=%d" % len(sem["semantic_items"])))
 
         # 4) 删除记录后语义索引同步清理
-        http(base, "/api/biz/worklogs/%d" % log_id, "DELETE")
-        log_id = None
+        http(base, "/api/biz/incidents/%d" % inc_id, "DELETE")
+        inc_id = None
         after = http(base, sem_q)
         results.append(check("删除后语义索引无残留", not any(
-            i["type"] == "worklog" and PREFIX in str(i.get("title", ""))
+            i["type"] == "incident" and PREFIX in str(i.get("title", ""))
             for i in after["semantic_items"])))
 
         # 5) 外部索引默认关闭
@@ -222,9 +224,9 @@ def main() -> int:
               flush=True)
         return 0 if ok else 1
     finally:
-        if log_id is not None:
+        if inc_id is not None:
             try:
-                http(base, "/api/biz/worklogs/%d" % log_id, "DELETE")
+                http(base, "/api/biz/incidents/%d" % inc_id, "DELETE")
             except Exception:  # noqa: BLE001
                 pass
         if rid is not None:

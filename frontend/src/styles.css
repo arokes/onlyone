@@ -25,6 +25,10 @@
 
   --success: #4d7459;
   --danger: #b03a2e;
+  /* 警示黄（区别于 danger 红）：运维超期这类"该处理但没出错"的状态。
+     文字 #8a6420 在暖纸 4.88:1，过 AA；浅底只承载 13px 正文。 */
+  --warn: #8a6420;
+  --warn-soft: #fbf2e4;
 
   --night: #1f3040;
   --night-2: #263a4c;
@@ -107,6 +111,12 @@ mark {
 .stat-tile .stat-value.accent { color: var(--accent-strong); }
 .stat-tile .stat-value.ok { color: var(--success); }
 .stat-tile .stat-value.warn { color: var(--danger); }
+
+/* 运维记录超期行（BizCrud 的 rowClass 注入）：行底浅黄 + 左侧 3px 警示条。
+   不用整行高饱和填充，避免和选中态 / hover 态打架。 */
+tr.row-overdue > td { background: var(--warn-soft); }
+tr.row-overdue:hover > td { background: var(--warn-soft); }
+tr.row-overdue > td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 
 /* 只读文本块（预览正文 / 命中片段）用暖纸色，避免冷灰割裂 */
 .paper-block {

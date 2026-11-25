@@ -6,11 +6,14 @@
  */
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
 import { NButton, NDataTable, NModal, useDialog, useMessage } from 'naive-ui'
-import type { DataTableColumns } from 'naive-ui'
+import type { DataTableColumns, SelectOption } from 'naive-ui'
 import { api } from '@/api/client'
 import BizFieldInput from './BizFieldInput.vue'
+import BizFilterBar from './BizFilterBar.vue'
 import EmptyState from './EmptyState.vue'
-import type { Field } from './biz-types'
+import type { Field, FilterSpec } from './biz-types'
+import { useViewStateStore } from '@/stores/viewState'
+import { countImages, docToText } from '@/utils/richtext'
 
 const props = defineProps<{
   kind: string
@@ -22,11 +25,24 @@ const props = defineProps<{
   projectId?: number | null
   /** 空状态补充说明（不给则用通用文案） */
   emptyDesc?: string
+  /** 外部指定要打开的记录 id（全局搜索 → 运维记录）：列表就绪后打开编辑弹窗 */
+  openEntryId?: number | null
+  /** 列表筛选声明（不给则没有筛选栏） */
+  filters?: FilterSpec[]
+  /** 筛选记忆键（一般传表 kind）：给了就跨页签保留筛选条件 */
+  filterKey?: string
+  /** 行级样式钩子（运维记录用：未关闭且超期的行标黄）；返回 class 字符串 */
+  rowClass?: (row: Record<string, any>) => string
 }>()
-const emit = defineEmits<{ (e: 'extra', row: Record<string, any>): void }>()
+const emit = defineEmits<{
+  (e: 'extra', row: Record<string, any>): void
+  /** 已处理完一次外部打开请求，父级可清空 openEntryId */
+  (e: 'opened'): void
+}>()
 
 const message = useMessage()
 const dialog = useDialog()
+const viewState = useViewStateStore()
 const rows = ref<Record<string, any>[]>([])
 const projects = ref<Record<string, any>[]>([])
 const loading = ref(false)
@@ -40,6 +56,120 @@ const projectOptions = computed(() =>
   projects.value.map(p => ({ label: String(p.name), value: p.id as number })),
 )
 
+// ---------------------------------------------------------------- 列表筛选
+/** 筛选值：keyword/text 为字符串，select/project 为标量，daterange 为 [起, 止] */
+const filterValues = reactive<Record<string, any>>({})
+
+function resetFilterValues() {
+  for (const spec of props.filters || []) {
+    filterValues[spec.key] = spec.type === 'daterange' ? null : (spec.type === 'keyword' || spec.type === 'text' ? '' : null)
+  }
+}
+watch(() => props.filters, () => {
+  resetFilterValues()
+  // 切页签回来时恢复上次的筛选条件（键由父级指定，如 'incidents'）
+  if (!props.filterKey) return
+  const saved = viewState.filtersFor(props.filterKey)
+  if (!saved) return
+  for (const spec of props.filters || []) {
+    if (spec.key in saved) filterValues[spec.key] = saved[spec.key]
+  }
+}, { immediate: true })
+
+/** select 类筛选项的候选值：显式 options 优先，否则从现有行去重（公司就是这条路） */
+const filterOptions = computed<Record<string, SelectOption[]>>(() => {
+  const out: Record<string, SelectOption[]> = {}
+  for (const spec of props.filters || []) {
+    if (spec.type === 'project') {
+      out[spec.key] = projectOptions.value as SelectOption[]
+      continue
+    }
+    if (spec.type !== 'select') continue
+    if (spec.options?.length) {
+      out[spec.key] = spec.options.map(o => ({ label: o.label, value: String(o.value) }))
+      continue
+    }
+    const seen = new Set<string>()
+    for (const row of rows.value) {
+      const value = String(row[spec.key] ?? '').trim()
+      if (value) seen.add(value)
+    }
+    out[spec.key] = [...seen].sort((a, b) => a.localeCompare(b, 'zh-CN'))
+      .map(v => ({ label: v, value: v }))
+  }
+  return out
+})
+
+const filtersActive = computed(() => (props.filters || []).some(spec => {
+  const v = filterValues[spec.key]
+  if (Array.isArray(v)) return v.length > 0
+  return v !== null && v !== undefined && String(v).trim() !== ''
+}))
+
+/** 全文匹配的取样：富文本先抽纯文本，图片不产生字符 */
+function haystack(row: Record<string, any>): string {
+  const parts: string[] = []
+  for (const f of props.fields) {
+    const raw = row[f.key]
+    if (raw == null || raw === '') continue
+    parts.push(f.type === 'rich' ? docToText(raw) : String(raw))
+  }
+  return parts.join('\n').toLowerCase()
+}
+
+const filteredRows = computed(() => {
+  const list = props.filters || []
+  if (!list.length) return rows.value
+  const active = list.filter(spec => {
+    const v = filterValues[spec.key]
+    if (Array.isArray(v)) return v.length > 0
+    return v !== null && v !== undefined && String(v).trim() !== ''
+  })
+  if (!active.length) return rows.value
+
+  const haystacks = new Map<number, string>()
+  return rows.value.filter(row => active.every(spec => {
+    const value = filterValues[spec.key]
+    if (spec.type === 'keyword') {
+      const terms = String(value).toLowerCase().split(/\s+/).filter(Boolean)
+      let hay = haystacks.get(row.id)
+      if (hay === undefined) {
+        hay = haystack(row)
+        haystacks.set(row.id, hay)
+      }
+      return terms.every(term => hay.includes(term))
+    }
+    if (spec.type === 'daterange') {
+      const day = String(row[spec.key] ?? '').slice(0, 10)
+      const [start, end] = value as [string, string]
+      if (!day) return false
+      return (!start || day >= start) && (!end || day <= end)
+    }
+    if (spec.type === 'project') {
+      return Number(row[spec.key]) === Number(value)
+    }
+    if (spec.type === 'text') {
+      return String(row[spec.key] ?? '').toLowerCase()
+        .includes(String(value).toLowerCase())
+    }
+    return String(row[spec.key] ?? '') === String(value)
+  }))
+})
+
+/** 筛选条件变化后清掉勾选（被筛掉的行不该继续参与批量删除），并记住条件 */
+watch(filterValues, () => {
+  checkedRowKeys.value = []
+  if (props.filterKey) viewState.setFilters(props.filterKey, { ...filterValues })
+}, { deep: true })
+
+function onFilterUpdate(patch: Record<string, any>) {
+  if (patch.__reset) {
+    resetFilterValues()
+    return
+  }
+  Object.assign(filterValues, patch)
+}
+
 /** 已固定归属项目时，归属列既不显示也不让选，避免误改到别的项目 */
 const fixedProject = computed(() => typeof props.projectId === 'number' && props.projectId > 0)
 const visibleFields = computed(() =>
@@ -49,7 +179,6 @@ const visibleFields = computed(() =>
 const REQUIRED: Record<string, { key: string; label: string }[]> = {
   projects: [{ key: 'name', label: '项目名称' }],
   links: [{ key: 'title', label: '链接标题' }, { key: 'url', label: '链接地址' }],
-  worklogs: [{ key: 'log_date', label: '日志日期' }],
   incidents: [{ key: 'occurred_at', label: '发生时间' }],
 }
 const requiredFields = computed(() => REQUIRED[props.kind] ?? [])
@@ -108,6 +237,23 @@ onMounted(load)
 watch(() => props.projectId, () => {
   checkedRowKeys.value = []
   load()
+})
+
+/**
+ * 外部打开请求（全局搜索「在运维记录中打开」/ 深链接 ?open=）：
+ * 等行数据就绪后按 id 定位并打开编辑弹窗，完成后 emit opened 让父级清空。
+ * `handledOpenId` 防止列表刷新时重复弹窗；父级清空（传回 null）时复位。
+ */
+let handledOpenId: number | null = null
+watch([() => props.openEntryId, rows, loading], () => {
+  const target = props.openEntryId ?? null
+  if (target == null) { handledOpenId = null; return }
+  if (loading.value || handledOpenId === target) return
+  const row = rows.value.find(r => r.id === target)
+  handledOpenId = target
+  if (row) openEdit(row)
+  else message.warning('该记录可能已被删除，或不在当前项目下')
+  emit('opened')
 })
 
 function openCreate() {
@@ -202,6 +348,16 @@ function cellValue(row: Record<string, any>, f: Field): string {
     const o = f.options?.find(x => x.value === raw)
     return o ? o.label : (raw == null || raw === '' ? '—' : String(raw))
   }
+  // 富文本列存的是 ProseMirror JSON：只取纯文本，图片另记张数，
+  // 否则表格里会出现一整串 {"type":"doc"...}
+  if (f.type === 'rich') {
+    const text = docToText(raw).replace(/\s+/g, ' ').trim()
+    const images = countImages(raw)
+    if (!text && !images) return '—'
+    const cut = text.length > 60 ? text.slice(0, 60) + '…' : text
+    // 图片标记放前面：放末尾会被列宽省略号吃掉，等于没提示
+    return images ? (cut ? `〔${images} 图〕 ${cut}` : `〔${images} 图〕`) : cut
+  }
   if (raw == null || raw === '') return '—'
   const text = String(raw)
   return f.type === 'textarea' && text.length > 60 ? text.slice(0, 60) + '…' : text
@@ -237,7 +393,7 @@ async function copyRows() {
   const selected = checkedRowKeys.value
   const list = selected.length
     ? rows.value.filter(r => selected.includes(r.id))
-    : rows.value
+    : filteredRows.value
   if (!list.length) {
     message.warning('没有可复制的数据')
     return
@@ -292,8 +448,23 @@ function renderCell(f: Field, row: Record<string, any>) {
   return cellValue(row, f)
 }
 
+/**
+ * 行双击 → 打开编辑弹窗（与记事本列表的"单击即开"同一交互直觉）。
+ * 操作列里的按钮 / 复制链接按钮上的双击不接管，避免一次双击弹出两层编辑。
+ */
+function rowProps(row: Record<string, any>) {
+  return {
+    // 行级样式（超期标黄等）由页面通过 rowClass 注入，组件本身不认识业务语义
+    class: props.rowClass?.(row) || undefined,
+    onDblclick: (event: MouseEvent) => {
+      if ((event.target as HTMLElement | null)?.closest('button, a')) return
+      openEdit(row)
+    },
+  }
+}
+
 /** 分页：0 行时整条隐藏（避免"空表还挂着 1 2 >"），有数据时可选每页条数 */
-const paginationProps = computed(() => (rows.value.length ? {
+const paginationProps = computed(() => (filteredRows.value.length ? {
   pageSize: 10,
   showSizePicker: true,
   pageSizes: [10, 20, 50],
@@ -316,7 +487,10 @@ const columns = computed<DataTableColumns>(() => {
     key: '__actions',
     width: props.extra ? 230 : 160,
     fixed: 'right',
-    render: (row: any) => h('div', { class: 'row' }, [
+    render: (row: any) => h('div', {
+      class: 'row',
+      onDblclick: (event: MouseEvent) => event.stopPropagation(),
+    }, [
       h(NButton, { size: 'tiny', secondary: true, onClick: () => openEdit(row) },
         { default: () => '编辑' }),
       h(NButton, { size: 'tiny', quaternary: true, type: 'error', onClick: () => remove(row) },
@@ -333,7 +507,7 @@ const columns = computed<DataTableColumns>(() => {
   <div class="card">
     <div class="row" style="margin-bottom: 12px">
       <h3 class="section-title">{{ title }}</h3>
-      <span class="count-chip">{{ rows.length }}</span>
+      <span class="count-chip">{{ filteredRows.length }}</span>
       <div class="grow" />
       <n-button size="small" quaternary @click="load">刷新</n-button>
       <n-button size="small" quaternary :disabled="!checkedRowKeys.length" @click="copyRows">
@@ -345,23 +519,32 @@ const columns = computed<DataTableColumns>(() => {
       </n-button>
       <n-button size="small" type="primary" @click="openCreate">新增</n-button>
     </div>
+    <biz-filter-bar
+      v-if="filters?.length"
+      :filters="filters" :values="filterValues" :options="filterOptions"
+      :matched="filteredRows.length" :total="rows.length"
+      @update="onFilterUpdate"
+    />
     <div class="muted" style="margin-bottom: 10px">
-      勾选行后可批量删除或按列复制；未勾选时「复制表格」导出当前全部行（TSV，可直接粘贴到 Excel）。
+      勾选行后可批量删除或按列复制；未勾选时「复制表格」导出当前筛选后的全部行（TSV，可直接粘贴到 Excel）。
     </div>
     <n-data-table
       v-model:checked-row-keys="checkedRowKeys"
       :row-key="(row: any) => row.id"
-      :columns="columns" :data="rows" :loading="loading"
-      :bordered="false" size="small" :scroll-x="1020"
+      :columns="columns" :data="filteredRows" :loading="loading"
+      :row-props="rowProps"
+      :bordered="false" size="small" :scroll-x="1212"
       :pagination="paginationProps"
     >
       <template #empty>
         <empty-state
           v-if="!loading"
           compact
-          :title="`还没有${title}`"
-          :desc="emptyDesc || '新建第一条后，它会自动进入全文索引，可在全局搜索里按关键词找到。'"
-          :action-text="`新增${title}`"
+          :title="filtersActive ? '没有匹配的记录' : `还没有${title}`"
+          :desc="filtersActive
+            ? '当前筛选条件下没有结果，试试放宽关键字或点「清除筛选」。'
+            : (emptyDesc || '新建第一条后，它会自动进入全文索引，可在全局搜索里按关键词找到。')"
+          :action-text="filtersActive ? '' : `新增${title}`"
           @action="openCreate"
         />
       </template>
@@ -370,7 +553,8 @@ const columns = computed<DataTableColumns>(() => {
 
   <n-modal
     v-model:show="showModal" preset="card"
-    :title="(editingId ? '编辑' : '新增') + title" style="width: 580px"
+    :title="(editingId ? '编辑' : '新增') + title"
+    style="width: 780px; max-width: 94vw; max-height: 88vh; overflow: auto"
   >
     <div v-for="f in visibleFields" :key="f.key" class="form-row">
       <label class="form-label">

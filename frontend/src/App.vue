@@ -15,9 +15,9 @@ import SetupWizard from '@/components/SetupWizard.vue'
 import { api } from '@/api/client'
 import { useJumpStore } from '@/stores/jump'
 
+const HomeView = defineAsyncComponent(() => import('@/views/HomeView.vue'))
 const SearchView = defineAsyncComponent(() => import('@/views/SearchView.vue'))
 const ProjectsView = defineAsyncComponent(() => import('@/views/ProjectsView.vue'))
-const WorklogsView = defineAsyncComponent(() => import('@/views/WorklogsView.vue'))
 const IncidentsView = defineAsyncComponent(() => import('@/views/IncidentsView.vue'))
 const LinksView = defineAsyncComponent(() => import('@/views/LinksView.vue'))
 const NotesView = defineAsyncComponent(() => import('@/views/NotesView.vue'))
@@ -26,10 +26,10 @@ const RootsView = defineAsyncComponent(() => import('@/views/RootsView.vue'))
 const PlaceholderView = defineAsyncComponent(() => import('@/views/PlaceholderView.vue'))
 
 const navItems = [
+  { key: 'home', label: '概览', group: '知识' },
   { key: 'search', label: '全局搜索', group: '知识' },
   { key: 'notes', label: '记事本', group: '知识' },
   { key: 'projects', label: '项目事项', group: '业务' },
-  { key: 'worklogs', label: '工作日志', group: '业务' },
   { key: 'incidents', label: '运维记录', group: '业务' },
   { key: 'links', label: '企微链接', group: '业务' },
   { key: 'credentials', label: '凭据库', group: '系统' },
@@ -143,10 +143,10 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
             </n-alert>
             <div v-else-if="!ready" class="center"><n-spin size="small" /> 正在连接本地服务…</div>
             <template v-else>
-              <SearchView v-if="activeTab === 'search'" />
+              <HomeView v-if="activeTab === 'home'" />
+              <SearchView v-else-if="activeTab === 'search'" />
               <NotesView v-else-if="activeTab === 'notes'" />
               <ProjectsView v-else-if="activeTab === 'projects'" />
-              <WorklogsView v-else-if="activeTab === 'worklogs'" />
               <IncidentsView v-else-if="activeTab === 'incidents'" />
               <LinksView v-else-if="activeTab === 'links'" />
               <CredentialsView v-else-if="activeTab === 'credentials'" />

@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""M3 验收集：四表 CRUD、统一条目同步、跨类型检索、关联闭环、链接安全、清理。
+"""M3 验收集：三表 CRUD、统一条目同步、跨类型检索、关联闭环、链接安全、清理。
+
+工作日志已于 2026-11-23 停用（撤界面 + 退出检索），本脚本不再覆盖该类型。
 
 自带后端进程，不依赖已运行实例；可反复运行（用 ``M3验证-`` 前缀幂等清理）。
 用法：py -3 tools\\verify_m3.py
@@ -39,7 +41,7 @@ def http(base: str, path: str, method: str = "GET", body=None):
 def purge(base: str) -> int:
     """删除本脚本创建的全部记录（按前缀识别），成功失败都执行。"""
     removed = 0
-    for kind in ("worklogs", "incidents", "links", "projects"):
+    for kind in ("incidents", "links", "projects"):
         try:
             for row in http(base, "/api/biz/" + kind):
                 if PREFIX in json.dumps(row, ensure_ascii=False):
@@ -89,12 +91,9 @@ def main() -> int:
         if purged:
             print("CLEAN 历史遗留记录", purged, flush=True)
 
-        # 1) 四类业务记录 CRUD 创建，并确认条目同步
+        # 1) 三类业务记录 CRUD 创建，并确认条目同步
         project = http(base, "/api/biz/projects", "POST",
                        {"data": {"name": MARK, "note": MARK + " 项目说明", "status": "active"}})
-        log = http(base, "/api/biz/worklogs", "POST",
-                   {"data": {"log_date": "2026-11-06", "content": MARK + " 日志内容",
-                             "minutes": 45, "project_id": project["id"]}})
         incident = http(base, "/api/biz/incidents", "POST",
                         {"data": {"occurred_at": "2026-11-06 09:00", "system": MARK,
                                   "symptom": "数据库主从切换失败 " + MARK,
@@ -103,7 +102,7 @@ def main() -> int:
         link = http(base, "/api/biz/links", "POST",
                     {"data": {"title": MARK, "url": "https://doc.weixin.qq.com/doc/demo",
                               "note": MARK + " 链接备注", "project_id": project["id"]}})
-        ids = {"projects": project["id"], "worklogs": log["id"],
+        ids = {"projects": project["id"],
                "incidents": incident["id"], "links": link["id"]}
         print("CREATED", ids, flush=True)
 
@@ -119,14 +118,14 @@ def main() -> int:
         print("SEARCH 跨类型 -> mode=%s hits=%d types=%s" % (res["mode"], len(res["items"]), types),
               flush=True)
         results.append(check("跨类型 FTS5 命中", res["mode"] == "fts5_trigram"
-                             and {"project", "worklog", "incident", "link"} <= types,
+                             and {"project", "incident", "link"} <= types,
                              str(sorted(types))))
         results.append(check("命中片段", all(i.get("snippet") for i in res["items"])))
 
         # 3) 两字中文 LIKE 兜底仍跨类型
         short = http(base, "/api/search?q=" + urllib.parse.quote("演练"))
         results.append(check("短词 LIKE 跨类型", short["mode"] == "like_fallback"
-                             and len({i["type"] for i in short["items"]}) >= 4,
+                             and len({i["type"] for i in short["items"]}) >= 3,
                              "hits=%d" % len(short["items"])))
 
         # 4) 业务记录只读预览返回正文
@@ -138,9 +137,9 @@ def main() -> int:
         else:
             results.append(check("业务记录预览", False, "未命中运维记录"))
 
-        # 5) 关联到项目闭环
-        logs = http(base, "/api/biz/worklogs")
-        log_row = next(r for r in logs if r["id"] == log["id"])
+        # 5) 关联到项目闭环（原来用工作日志承载，工作日志停用后改用工微链接）
+        logs = http(base, "/api/biz/links")
+        log_row = next(r for r in logs if r["id"] == link["id"])
         linked = http(base, "/api/entries/%d/link-project" % log_row["entry_id"], "POST",
                       {"project_id": project["id"]})
         rels = http(base, "/api/relations?entry_id=%d" % project["entry_id"])
@@ -171,11 +170,11 @@ def main() -> int:
                              not http(base, "/api/relations?entry_id=%d" % project["entry_id"])))
 
         # 6) 更新后 FTS 同步
-        http(base, "/api/biz/worklogs/%d" % log["id"], "PUT",
-             {"data": {"content": MARK + " 已更新内容XYZ"}})
+        http(base, "/api/biz/links/%d" % link["id"], "PUT",
+             {"data": {"note": MARK + " 已更新内容XYZ"}})
         updated = http(base, "/api/search?q=" + urllib.parse.quote("已更新内容XYZ"))
         results.append(check("更新同步 FTS", any(
-            i["type"] == "worklog" and i["ref_id"] == log["id"] for i in updated["items"])))
+            i["type"] == "link" and i["ref_id"] == link["id"] for i in updated["items"])))
 
         # 7) 删除后条目与关联清理
         http(base, "/api/biz/incidents/%d" % incident["id"], "DELETE")
@@ -191,8 +190,8 @@ def main() -> int:
 
         # 9) 删除项目时解除其余业务记录引用
         http(base, "/api/biz/projects/%d" % project["id"], "DELETE")
-        logs_after = http(base, "/api/biz/worklogs")
-        stale = [r for r in logs_after if r["id"] == log["id"] and r["project_id"] is not None]
+        links_after = http(base, "/api/biz/links")
+        stale = [r for r in links_after if r["id"] == link["id"] and r["project_id"] is not None]
         results.append(check("删除项目解除引用", not stale))
 
         ok = all(results)

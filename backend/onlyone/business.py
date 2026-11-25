@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from . import sap
+from . import rich, sap
 from .db import connect, decrypt
 from .entries import ENTITIES, NUMERIC_FIELDS, Entity, drop_entry, sync_entry, unlink_project
 
@@ -126,8 +126,6 @@ def _validate(kind: str, data: dict[str, Any], creating: bool) -> None:
             url = str(data.get("url") or "").strip()
             if not url.lower().startswith(("http://", "https://")):
                 raise HTTPException(400, "链接必须以 http:// 或 https:// 开头")
-    elif kind == "worklogs":
-        required("log_date", "日志日期")
     elif kind == "incidents":
         required("occurred_at", "发生时间")
 
@@ -257,8 +255,6 @@ def project_workspace(project_id: int, limit: int = 5):
         counts = {
             "links": conn.execute("SELECT COUNT(*) FROM links WHERE project_id=?",
                                   (project_id,)).fetchone()[0],
-            "worklogs": conn.execute("SELECT COUNT(*) FROM worklogs WHERE project_id=?",
-                                     (project_id,)).fetchone()[0],
             "incidents": conn.execute("SELECT COUNT(*) FROM incidents WHERE project_id=?",
                                       (project_id,)).fetchone()[0],
             "notes": conn.execute(
@@ -280,20 +276,20 @@ def project_workspace(project_id: int, limit: int = 5):
             counts["files"] = 0
 
         previews: dict[str, list[dict]] = {k: [] for k in
-                                           ("links", "worklogs", "incidents", "notes", "files")}
+                                           ("links", "incidents", "notes", "files")}
         if limit:
             previews["links"] = [dict(r) for r in conn.execute(
                 """SELECT id, title, url, note FROM links WHERE project_id=?
                    ORDER BY COALESCE(last_check_at,'') DESC, id DESC LIMIT ?""",
                 (project_id, limit))]
-            previews["worklogs"] = [dict(r) for r in conn.execute(
-                """SELECT id, log_date, content, minutes FROM worklogs WHERE project_id=?
-                   ORDER BY log_date DESC, id DESC LIMIT ?""",
-                (project_id, limit))]
             previews["incidents"] = [dict(r) for r in conn.execute(
-                """SELECT id, occurred_at, system, symptom, status FROM incidents
+                """SELECT id, occurred_at, category, system, proposer, company, symptom, status
+                   FROM incidents
                    WHERE project_id=? ORDER BY occurred_at DESC, id DESC LIMIT ?""",
                 (project_id, limit))]
+            # symptom 是富文本列；预览卡片只要纯文本，避免把 JSON 结构漏到界面上
+            for item in previews["incidents"]:
+                item["symptom"] = rich.extract_text(item.get("symptom"))
             previews["notes"] = [dict(r) for r in conn.execute(
                 """SELECT id, title, updated_at, substr(content_text,1,120) AS excerpt
                    FROM notes WHERE project_id=? AND is_private=0

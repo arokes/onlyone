@@ -30,7 +30,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from . import desktop, entries, mht_import, semantic
+from . import desktop, entries, mht_import, rich, semantic
+from .attachments import image_ext
 from .db import DATA_DIR, DB_PATH, connect
 
 log = logging.getLogger("onlyone")
@@ -42,7 +43,6 @@ MAX_INDEX_CHARS = 20_000          # 入 FTS / 语义向量的正文上限
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 PROJECT_BOOK = "项目笔记"        # 项目工作台新建页面时的默认笔记本
 SAFE_FILENAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|jpeg|gif|webp)$")
-BLOCK_TYPES = {"paragraph", "heading", "codeBlock", "blockquote", "listItem"}
 # 导出 HTML 是脱离应用的独立文件，无法引用前端 CSS 变量，这里内联等价的暖纸色值；
 # 只覆盖表格与基础排版，不做像素级复刻。
 EXPORT_STYLE = (
@@ -115,28 +115,12 @@ def _parse_doc(content_json: str) -> dict:
 
 
 def _extract_text(content_json: str) -> str:
-    """从 ProseMirror JSON 抽纯文本（FTS / 语义 / 摘要用）。"""
-    parts: list[str] = []
+    """从 ProseMirror JSON 抽纯文本（FTS / 语义 / 摘要用）。
 
-    def walk(node) -> None:
-        if isinstance(node, list):
-            for child in node:
-                walk(child)
-            return
-        if not isinstance(node, dict):
-            return
-        kind = node.get("type")
-        if kind == "text":
-            parts.append(str(node.get("text") or ""))
-        elif kind == "hardBreak":
-            parts.append("\n")
-        for child in node.get("content") or []:
-            walk(child)
-        if kind in BLOCK_TYPES:
-            parts.append("\n")
-
-    walk(_parse_doc(content_json).get("content") or [])
-    return "".join(parts)
+    实现收在 ``rich.extract_text``：运维记录等业务列的富文本字段用同一套结构，
+    两处若各写一份就会漂移（图片节点是否出字符、块级如何补换行）。
+    """
+    return rich.extract_text(content_json)
 
 
 def _int_attr(attrs: dict, name: str) -> int:
@@ -695,7 +679,7 @@ def _materialize_images(note_id: int, doc: dict,
                 name = src[len(mht_import.IMG_SCHEME):]
                 item = images.get(name)
                 raw = item[0] if item else b""
-                ext = _image_ext(raw) if raw else None
+                ext = image_ext(raw) if raw else None
                 if not raw or ext is None or len(raw) > MAX_IMAGE_BYTES:
                     missing.append(name)
                     continue
@@ -999,16 +983,7 @@ def delete_note(note_id: int):
 
 # ---------------------------------------------------------------- 图片附件
 
-def _image_ext(raw: bytes) -> str | None:
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "jpg"
-    if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
-        return "gif"
-    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        return "webp"
-    return None
+# 魔数判定统一在 attachments.image_ext（业务记录上传用的也是它），此处不再重复实现
 
 
 @router.post("/api/notes/{note_id}/images")
@@ -1033,7 +1008,7 @@ def upload_image(note_id: int, body: ImageIn):
         raise HTTPException(400, "图片数据不是合法 base64") from exc
     if not raw or len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(400, "图片为空或超过 10 MB")
-    ext = _image_ext(raw)
+    ext = image_ext(raw)
     if ext is None:
         raise HTTPException(400, "不支持的图片格式（仅 png/jpg/gif/webp）")
     # 文件名即内容哈希（前 32 位 hex）——仍满足 SAFE_FILENAME 白名单，且天然幂等：

@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS files (
   indexed_at TEXT,
   UNIQUE(root_id, rel_path)
 );
+-- 概览页「最近改动」按 mtime 倒序取前 8 条：没有索引时全表排序实测 233ms（113MB 库）。
+CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
 CREATE TABLE IF NOT EXISTS entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL,
@@ -85,6 +87,8 @@ CREATE TABLE IF NOT EXISTS links (
   note TEXT NOT NULL DEFAULT '', snapshot_path TEXT NOT NULL DEFAULT '',
   last_check_at TEXT
 );
+-- 已停用（2026-11-23）：不再有界面入口与 CRUD API，历史数据原样留在本表，
+-- 但对应的 entries / fts 行会在 init_db 的迁移里清掉（退出全局检索）。
 CREATE TABLE IF NOT EXISTS worklogs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   log_date TEXT NOT NULL, project_id INTEGER,
@@ -93,7 +97,9 @@ CREATE TABLE IF NOT EXISTS worklogs (
 );
 CREATE TABLE IF NOT EXISTS incidents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  occurred_at TEXT NOT NULL, system TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT NOT NULL, category TEXT NOT NULL DEFAULT '',
+  system TEXT NOT NULL DEFAULT '',
+  proposer TEXT NOT NULL DEFAULT '', company TEXT NOT NULL DEFAULT '',
   symptom TEXT NOT NULL DEFAULT '', root_cause TEXT NOT NULL DEFAULT '',
   action TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
   duration_min INTEGER NOT NULL DEFAULT 0, project_id INTEGER,
@@ -192,10 +198,44 @@ def init_db() -> None:
             conn.execute("ALTER TABLE notes ADD COLUMN project_id INTEGER")
             log.info("notes 表已补 project_id 列")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id)")
+        # 运维记录增加提出人 / 公司 / 类型；老库补列，历史行取空串
+        # （类型空值在界面上显示「—」，不强行回填，避免篡改历史记录语义）。
+        incident_cols = {r["name"] for r in conn.execute("PRAGMA table_info(incidents)")}
+        for column in ("proposer", "company", "category"):
+            if incident_cols and column not in incident_cols:
+                conn.execute("ALTER TABLE incidents "
+                             "ADD COLUMN %s TEXT NOT NULL DEFAULT ''" % column)
+                log.info("incidents 表已补 %s 列", column)
+        _purge_worklog_index(conn)
         conn.commit()
         log.info("db ready: %s", DB_PATH)
     finally:
         conn.close()
+
+
+# 工作日志停用标记：清完索引行后写进 app_meta，避免每次启动都全表扫一遍。
+_WORKLOG_PURGED_KEY = "worklogs_index_purged_v1"
+
+
+def _purge_worklog_index(conn) -> None:
+    """工作日志退出检索（2026-11-23）：删掉 worklog 条目与 FTS 行，保留 worklogs 表数据。
+
+    ``fts_entries`` 没有外键，必须显式删；``semantic_index`` 随 entries 级联。
+    ``entry_relations`` 同样无外键，悬空关联一并清理，避免关系抽屉指向不存在的条目。
+    只在首次迁移执行（app_meta 标记），老库重复启动不会反复扫表。
+    """
+    if conn.execute("SELECT 1 FROM app_meta WHERE key=?", (_WORKLOG_PURGED_KEY,)).fetchone():
+        return
+    ids = [r[0] for r in conn.execute("SELECT id FROM entries WHERE type='worklog'")]
+    for entry_id in ids:
+        conn.execute("DELETE FROM fts_entries WHERE entry_id=?", (entry_id,))
+        conn.execute("DELETE FROM entry_relations "
+                     "WHERE src_entry_id=? OR dst_entry_id=?", (entry_id, entry_id))
+    conn.execute("DELETE FROM entries WHERE type='worklog'")
+    conn.execute("INSERT OR REPLACE INTO app_meta(key,value) "
+                 "VALUES(?, datetime('now','localtime'))", (_WORKLOG_PURGED_KEY,))
+    if ids:
+        log.info("工作日志已退出检索：清理 %d 个条目", len(ids))
 
 
 class _Blob(ctypes.Structure):

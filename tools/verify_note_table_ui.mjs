@@ -210,6 +210,91 @@ async function main() {
         JSON.stringify(shape))
   check('首行渲染为表头 th', shape && shape.heads === 3, JSON.stringify(shape))
 
+  // 2.5) 列宽拖动 + mouseup 丢失后的自愈（兜底逻辑在 NotesView 的 recoverStuckColumnDrag）
+  const colEdge = async idx => JSON.parse(await evaluate(`(() => {
+    const cells = [...document.querySelectorAll('.tiptap-body table tr')[0].children];
+    const r = cells[${idx}].getBoundingClientRect();
+    return JSON.stringify({ x: r.right - 2, y: r.top + r.height / 2, w: Math.round(r.width) });
+  })()`))
+  const m = (type, x, y, extra = {}) =>
+    cdp('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1, ...extra })
+
+  const edge = await colEdge(0)
+  await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: edge.x, y: edge.y })
+  await sleep(250)
+  const handleShown = await evaluate(
+    `document.querySelectorAll('.column-resize-handle').length > 0`)
+  const beforeAll = JSON.parse(await evaluate(`(() => {
+    const cells = [...document.querySelectorAll('.tiptap-body table tr')[0].children];
+    return JSON.stringify(cells.map(c => Math.round(c.getBoundingClientRect().width)));
+  })()`))
+  await m('mousePressed', edge.x, edge.y, { buttons: 1 })
+  for (const dx of [30, 80]) {
+    await cdp('Input.dispatchMouseEvent',
+              { type: 'mouseMoved', x: edge.x + dx, y: edge.y, button: 'left', buttons: 1 })
+    await sleep(90)
+  }
+  await m('mouseReleased', edge.x + 80, edge.y, { buttons: 0 })
+  await sleep(400)
+  const afterAll = JSON.parse(await evaluate(`(() => {
+    const cells = [...document.querySelectorAll('.tiptap-body table tr')[0].children];
+    return JSON.stringify(cells.map(c => Math.round(c.getBoundingClientRect().width)));
+  })()`))
+  check('拖动只改目标列', handleShown && afterAll[0] >= beforeAll[0] + 40,
+        `${beforeAll} -> ${afterAll}`)
+  check('其他列宽度不变', Math.abs(afterAll[1] - beforeAll[1]) <= 1
+        && Math.abs(afterAll[2] - beforeAll[2]) <= 1, `${beforeAll} -> ${afterAll}`)
+
+  // 拖第二列但不发 mouseup（模拟收尾丢失），靠左键已松开的 mousemove 自愈
+  const edge2 = await colEdge(1)
+  await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: edge2.x, y: edge2.y })
+  await sleep(220)
+  await m('mousePressed', edge2.x, edge2.y, { buttons: 1 })
+  await cdp('Input.dispatchMouseEvent',
+            { type: 'mouseMoved', x: edge2.x + 50, y: edge2.y, button: 'left', buttons: 1 })
+  await sleep(150)
+  const midW = await evaluate(`Math.round(
+    document.querySelector('.tiptap-body table tr').children[1].getBoundingClientRect().width)`)
+  await cdp('Input.dispatchMouseEvent',
+            { type: 'mouseMoved', x: edge2.x + 50, y: 760, button: 'none', buttons: 0 })
+  await sleep(220)
+  const backW = await evaluate(`Math.round(
+    document.querySelector('.tiptap-body table tr').children[1].getBoundingClientRect().width)`)
+  check('mouseup 丢失后列宽不回弹', backW === midW, `${midW} -> ${backW}`)
+
+  // 拖宽后表格总宽已超容器，最右列在可视区外，先横向滚到最右再取边界
+  await evaluate(`(() => {
+    const w = document.querySelector('.tableWrapper');
+    if (w) w.scrollLeft = w.scrollWidth;
+    return true;
+  })()`)
+  await sleep(200)
+  const edge3 = await colEdge(2)
+  await cdp('Input.dispatchMouseEvent',
+            { type: 'mouseMoved', x: edge3.x, y: edge3.y, button: 'none', buttons: 0 })
+  await sleep(250)
+  const handleIdx = await evaluate(`(() => {
+    const h = document.querySelector('.column-resize-handle');
+    return h ? h.parentElement.cellIndex : null;
+  })()`)
+  check('自愈后手柄能切到其他列', handleIdx === 2, `cellIndex=${handleIdx}`)
+
+  // 光标点回第一格（先把表格滚回最左，否则第一列在可视区外点不到）
+  await evaluate(`(() => {
+    const w = document.querySelector('.tableWrapper');
+    if (w) w.scrollLeft = 0;
+    return true;
+  })()`)
+  await sleep(150)
+  const first0 = JSON.parse(await evaluate(`(() => {
+    const th = document.querySelector('.tiptap-body table th');
+    const r = th.getBoundingClientRect();
+    return JSON.stringify({ x: r.left + 20, y: r.top + r.height / 2 });
+  })()`))
+  await m('mousePressed', first0.x, first0.y, { buttons: 1 })
+  await m('mouseReleased', first0.x, first0.y, { buttons: 0 })
+  await sleep(250)
+
   // 3) 单元格输入：插入后光标在第一格
   await cdp('Input.insertText', { text: '库名' })
   await sleep(300)

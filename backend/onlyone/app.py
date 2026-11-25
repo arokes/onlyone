@@ -14,10 +14,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import __version__, backends, ocr, watcher
+from .attachments import router as attach_router
 from .backup import router as backup_router
 from .business import router as biz_router
 from .credentials import router as cred_router
 from .notes import router as notes_router
+from .overview import router as overview_router
 from .db import PROJECT_ROOT, connect, init_db
 from .scanner import (
     MAX_ATTEMPTS, progress_snapshot, root_write_lock, scan_root, start_scan_job,
@@ -181,9 +183,13 @@ def create_app(token: str) -> FastAPI:
     init_db()
     app = FastAPI(title="OnlyOne", version=__version__, docs_url="/api/docs")
     app.include_router(biz_router)    # M3：业务记录 CRUD / 关联 / 链接打开
+    # 图片池（内容寻址）先于 notes 注册：/api/attachments/blob/.. 与
+    # /api/attachments/{note_id}/{filename} 结构相同，靠字面量路由优先命中。
+    app.include_router(attach_router)
     app.include_router(cred_router)   # M4：DPAPI 凭据库
     app.include_router(notes_router)  # M7：记事本 / 图片 / 导出 / 全库备份
     app.include_router(backup_router) # M7：凭据加密导出与导入（C 方案）
+    app.include_router(overview_router)  # 2026-11-25：概览页聚合（只读）
 
     @app.middleware("http")
     async def token_guard(request: Request, call_next):

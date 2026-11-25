@@ -4,6 +4,7 @@ import { computed } from 'vue'
 import { NDatePicker, NInput, NInputNumber, NSelect } from 'naive-ui'
 import type { SelectOption } from 'naive-ui'
 import type { Field } from './biz-types'
+import RichTextField from './RichTextField.vue'
 
 const props = defineProps<{
   field: Field
@@ -19,8 +20,14 @@ const selectOptions = computed<SelectOption[]>(() =>
 </script>
 
 <template>
+  <rich-text-field
+    v-if="field.type === 'rich'" :model-value="modelValue"
+    :placeholder="`输入${field.label}，可直接 Ctrl+V 贴图`"
+    :min-height="72"
+    @update:model-value="set"
+  />
   <n-input
-    v-if="field.type === 'textarea'" :value="modelValue"
+    v-else-if="field.type === 'textarea'" :value="modelValue"
     type="textarea" :rows="3" @update:value="set"
   />
   <n-input

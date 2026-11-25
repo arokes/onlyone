@@ -55,7 +55,8 @@ async function unlink(r: Relation) {
 }
 
 function goto(r: Relation) {
-  jump.jumpToEntry(r.peer_id)
+  // 带上对端标题：关掉预览后搜索页仍有这组结果，不会落回空态
+  jump.jumpToEntry(r.peer_id, r.peer_title)
   emit('update:show', false)
 }
 </script>

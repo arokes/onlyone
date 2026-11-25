@@ -42,6 +42,11 @@ def search_entries(conn: sqlite3.Connection, q: str) -> tuple[str, list[int]]:
     FTS5 trigram 对两字中文词返回 0（本机实测），因此：
     >=3 字符走 trigram；短词或 trigram 零命中时降级为 title/body/tags 的 LIKE 扫描。
     一个条目可能有多条分片行，结果按 entry_id 去重（保留首次出现顺序）。
+
+    2026-11-25 增加 ``fts5_and``：整串短语 0 命中且查询含空格时，按词 AND 再试一次。
+    场景是「带日期的文件名」——`SAP GUI配置变更操作手册 v1.0 20261124` 这类整串
+    在 title 里并不连续（扩展名、日期、下划线把词切开了），短语匹配必然 0 命中，
+    退到 LIKE 全表扫要 20ms；按词 AND 由 FTS 引擎一次算交集，实测 0.3–0.6ms。
     """
     ids: list[int] = []
     if len(q) >= 3:
@@ -55,6 +60,21 @@ def search_entries(conn: sqlite3.Connection, q: str) -> tuple[str, list[int]]:
     ids = _dedupe(ids)
     if ids:
         return "fts5_trigram", ids
+
+    # 短语没命中：多词按 AND 再试。只取 >=3 字符的词，trigram 索引不到更短的。
+    terms = [t for t in q.split() if len(t) >= 3]
+    if len(terms) > 1:
+        expr = " AND ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            ids = [r[0] for r in conn.execute(
+                "SELECT entry_id FROM fts_entries WHERE fts_entries MATCH ? LIMIT ?",
+                (expr, _FETCH_ROWS))]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FTS5 AND 查询降级 %r: %s", q, exc)
+            ids = []
+        ids = _dedupe(ids)
+        if ids:
+            return "fts5_and", ids
 
     pat = "%" + q + "%"
     ids = _dedupe(

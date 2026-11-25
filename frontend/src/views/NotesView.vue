@@ -20,13 +20,10 @@ import {
 import { api, TOKEN } from '@/api/client'
 import EmptyState from '@/components/EmptyState.vue'
 import { useJumpStore } from '@/stores/jump'
-
-const COMPRESS_THRESHOLD = 5 * 1024 * 1024   // 超过即前端压缩
-const BACKEND_LIMIT = 10 * 1024 * 1024       // notes.py MAX_IMAGE_BYTES，兜底
-const MAX_EDGE = 2560                        // 压缩后最长边
-const IMAGE_MIME_EXT: Record<string, string> = {
-  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp',
-}
+import { useViewStateStore } from '@/stores/viewState'
+import {
+  BACKEND_LIMIT, IMAGE_MIME_EXT, dataUrlToFile, normalizeMime, uploadImageFile,
+} from '@/utils/image'
 
 interface NoteMeta {
   id: number; section_id: number; title: string; sort_order: number
@@ -42,6 +39,7 @@ interface NoteDetail {
 const message = useMessage()
 const dialog = useDialog()
 const jump = useJumpStore()
+const viewState = useViewStateStore()
 const books = ref<Notebook[]>([])
 const activeBookId = ref<number | null>(null)             // 下拉当前笔记本
 const renamingSectionId = ref<number | null>(null)        // 分区就地改名
@@ -100,6 +98,8 @@ const editor = useEditor({
     // allowTableNodeSelection 让点表格边缘可整表选中，方便删除 / 剪切。
     TableWithHeight.configure({
       resizable: true,
+      // 默认 5px 的命中区太窄，稍微偏一点就变成选中文字；8px 更好抓
+      handleWidth: 8,
       lastColumnResizable: true,
       allowTableNodeSelection: true,
     }),
@@ -115,12 +115,280 @@ const editor = useEditor({
   },
   onUpdate: () => {
     tableActive.value = !!editor.value?.isActive('table')
-    if (!loadingContent) markDirty()
+    if (loadingContent) return
+    markDirty()
+    // 粘进来的表格没有列宽，延迟固化一次，避免下次拖列时其他列跟着变
+    scheduleFreezeAll()
   },
   onSelectionUpdate: () => {
     tableActive.value = !!editor.value?.isActive('table')
   },
 })
+
+// ---- 列宽拖动兜底 ----
+// prosemirror-tables 只在 window 的一次 mouseup 上收尾：写 colwidth + 清 dragging。
+// 这次收尾一旦丢失或中途抛错，dragging 会永久为 true —— 手柄锁死在原列、之后拖哪列都在改
+// 原来那列（看着像"再没出现手柄"），而拖动期间只改了 DOM 的 <col>、没写进文档，重渲染即回弹。
+// 下面四个入口负责自愈；导入的表格带 colspan 时也按行游标展开，不会串列。
+const COL_RESIZE_KEY_PREFIX = 'tableColumnResizing'
+
+interface ColumnDragState { activeHandle: number; dragging: unknown }
+
+/** 列宽插件的 PluginKey —— 改插件状态必须用同一个实例，字符串 key 取不到。 */
+function columnResizePluginKey(): { getState: (state: unknown) => ColumnDragState | null } | null {
+  const view = (editor.value?.view ?? null) as unknown as
+    { isDestroyed?: boolean; state: { plugins: { key?: string; spec?: { key?: unknown } }[] } } | null
+  if (!view || view.isDestroyed) return null
+  const plugin = view.state.plugins.find(
+    p => String(p.key ?? '').startsWith(COL_RESIZE_KEY_PREFIX))
+  return (plugin?.spec?.key ?? null) as
+    { getState: (state: unknown) => ColumnDragState | null } | null
+}
+
+function columnDragState(): ColumnDragState | null {
+  const view = editor.value?.view
+  const key = columnResizePluginKey()
+  if (!view || !key) return null
+  return key.getState(view.state) ?? null
+}
+
+/** 选区所在表格的起始位置（定位失败返回 -1）。 */
+function tablePosFromSelection(): number {
+  const view = editor.value?.view
+  if (!view) return -1
+  const { $from } = view.state.selection
+  for (let d = $from.depth; d > 0; d--) {
+    if ($from.node(d).type.name === 'table') return $from.before(d)
+  }
+  return -1
+}
+
+/** 定位待处理的表格：优先用手柄所在的单元格反查（纯文档位置，不受 DOM 重建影响），
+ *  退化到光标所在的表。DOM 只用来读 <col> 的实际宽度。 */
+function locateActiveTable(handle: number): { tablePos: number; tableNode: any; tableEl: HTMLTableElement | null } | null {
+  const view = editor.value?.view
+  if (!view) return null
+  let tablePos = -1
+  if (handle >= 0 && handle <= view.state.doc.content.size) {
+    try {
+      const $pos = view.state.doc.resolve(handle)
+      for (let d = $pos.depth; d > 0; d--) {
+        if ($pos.node(d).type.name === 'table') { tablePos = $pos.before(d); break }
+      }
+    } catch { tablePos = -1 }
+  }
+  if (tablePos < 0) tablePos = tablePosFromSelection()
+  if (tablePos < 0) return null
+  const tableNode = view.state.doc.nodeAt(tablePos)
+  if (!tableNode || tableNode.type.name !== 'table') return null
+  const dom = view.nodeDOM(tablePos) as HTMLElement | null
+  const tableEl = (dom?.nodeName === 'TABLE' ? dom : dom?.querySelector('table')) as HTMLTableElement | null
+  return { tablePos, tableNode, tableEl }
+}
+
+/** 给表格单元格写 colwidth。
+ *
+ * prosemirror 渲染列宽（updateColumns / createColGroup）只读第一行，`firstRowOnly` 时只写首行，
+ * 避免宽表（96 列 × 上千行的权限矩阵）产生近十万次节点替换。首行单元格位置 =
+ * tablePos + 2 + cellOffset（+1 进表、+1 进行）。requireAny=true 时只写"DOM 上有明确宽度"的列。 */
+function applyColumnWidths(tr: any, tablePos: number, tableNode: any,
+                           widths: (number | null)[], requireAny: boolean,
+                           firstRowOnly = false): boolean {
+  let changed = false
+  let stop = false
+  tableNode.forEach((row: any, rowOffset: number) => {
+    if (stop) return
+    let col = 0
+    row.forEach((cell: any, cellOffset: number) => {
+      const colspan = cell.attrs.colspan || 1
+      // 空 content 的单元格在重建时会抛 RangeError（schema 要求 block+），直接跳过
+      if (!cell.content || cell.content.size === 0) { col += colspan; return }
+      const next: number[] = []
+      let any = false
+      for (let i = 0; i < colspan; i++) {
+        const w = widths[col + i]
+        if (w != null && w > 0) any = true
+        next.push(w ?? (cell.attrs.colwidth?.[i] ?? 0))
+      }
+      const prev = cell.attrs.colwidth as number[] | null
+      const same = !!prev && prev.length === next.length && prev.every((v, i) => v === next[i])
+      if ((!requireAny || any) && !same) {
+        const pos = tablePos + 2 + rowOffset + cellOffset
+        if (tr.doc.nodeAt(pos)) {
+          tr.setNodeMarkup(pos, null, { ...cell.attrs, colwidth: next })
+          changed = true
+        }
+      }
+      col += colspan
+    })
+    if (firstRowOnly) stop = true
+  })
+  return changed
+}
+
+/** 把 DOM 上已经拖出来的列宽补写回文档。只读 <col> 的 width —— 只有被拖过的列才有它，
+ *  其余列保持原值不覆盖。 */
+function commitDomColumnWidths(): boolean {
+  const view = editor.value?.view
+  if (!view) return false
+  const target = locateActiveTable(columnDragState()?.activeHandle ?? -1)
+  if (!target?.tableEl) return false
+  const cols = Array.from(
+    target.tableEl.querySelectorAll(':scope > colgroup > col')) as HTMLElement[]
+  const widths = cols.map(col => {
+    const w = Number.parseFloat(col.style.width)
+    return Number.isFinite(w) && w > 0 ? Math.round(w) : null
+  })
+  if (!widths.some(w => w != null)) return false
+  try {
+    const tr = view.state.tr
+    if (!applyColumnWidths(tr, target.tablePos, target.tableNode, widths, true)) return false
+    view.dispatch(tr)
+    return true
+  } catch (err) {
+    console.error('[notes] 补写列宽失败', err)
+    return false
+  }
+}
+
+/** 单元格的 content 必须是 block+。空 content 的数据能被 Tiptap 容错加载，但一旦被
+ *  setNodeMarkup 重建就会抛 `RangeError: Invalid content for node type tableCell`
+ *  （导入的表格里常见，尤其是整块空白的权限矩阵）。打开笔记时统一补一个空段落，
+ *  直接塞进单元格的行内节点（text/image）也包成段落。 */
+const INLINE_NODE_TYPES = new Set(['text', 'image', 'hardBreak'])
+
+function sanitizeTableCells(node: any): any {
+  if (Array.isArray(node)) return node.map(sanitizeTableCells)
+  if (!node || typeof node !== 'object') return node
+  const content: any[] | undefined = Array.isArray(node.content) ? node.content : undefined
+  if (node.type === 'tableCell' || node.type === 'tableHeader') {
+    const blocks = (content ?? []).filter(c => c && !INLINE_NODE_TYPES.has(c.type))
+    const inlines = (content ?? []).filter(c => c && INLINE_NODE_TYPES.has(c.type))
+    if (blocks.length) return { ...node, content: blocks.map(sanitizeTableCells) }
+    return { ...node, content: [{ type: 'paragraph', ...(inlines.length ? { content: inlines } : {}) }] }
+  }
+  return content ? { ...node, content: content.map(sanitizeTableCells) } : node
+}
+
+/** 把"还没固定列宽"的表格批量固化一次。
+ *
+ * 表格默认按容器宽度（CSS width:100%）排版，只有拖过的列有固定宽度，剩余宽度由浏览器
+ * 分给其他列 —— 所以拖一列会带着其他列一起变。每列都写上 colwidth 后，表格进入"固定列宽"
+ * 模式：拖哪列只改哪列，总宽随列宽之和变化（超出容器时表格区横向滚动）。
+ * 必须在拖动开始前调用（打开笔记 / 插入表格 / 悬停到列边界），拖动中途改文档会打断拖动。
+ * 合并单元格的宽度按 colspan 均分回各列。任何异常都只记日志，不影响编辑。 */
+function freezeAllTableWidths(): boolean {
+  const view = editor.value?.view
+  if (!view) return false
+  const host = view.dom as HTMLElement
+  // 布局还没就绪（容器宽度为 0）时读到的列宽是 min-width 25px，写进去会把表格压扁
+  const hostW = host?.clientWidth ?? 0
+  if (hostW < 200) return false
+  const tr = view.state.tr
+  let changed = false
+  try {
+    view.state.doc.descendants((node, pos) => {
+      if (node.type.name !== 'table') return
+      const dom = view.nodeDOM(pos) as HTMLElement | null
+      const tableEl = (dom?.nodeName === 'TABLE' ? dom : dom?.querySelector('table')) as HTMLTableElement | null
+      if (!tableEl) return false
+      // 同一道保险：表格明显不成形时不固化
+      if (tableEl.getBoundingClientRect().width < Math.min(120, hostW * 0.3)) return false
+      // 所有列都已是固定宽度（含被拖过的那列），不必再动。用 :scope 排除嵌套表格的 <col>
+      const cols = Array.from(
+        tableEl.querySelectorAll(':scope > colgroup > col')) as HTMLElement[]
+      if (cols.length && cols.every(c => (Number.parseFloat(c.style.width) || 0) > 0)) return false
+      const firstRow = tableEl.querySelector(':scope > tbody > tr, :scope > tr')
+      if (!firstRow) return false
+      const widths: number[] = []
+      for (const cell of Array.from(firstRow.children) as HTMLElement[]) {
+        const colspan = Number(cell.getAttribute('colspan') || 1) || 1
+        const w = cell.getBoundingClientRect().width / colspan
+        for (let i = 0; i < colspan; i++) widths.push(Math.max(1, Math.round(w)))
+      }
+      if (!widths.length) return false
+      if (applyColumnWidths(tr, pos, node, widths, false, true)) changed = true
+      return false
+    })
+  } catch (err) {
+    console.error('[notes] 固化列宽失败', err)
+    return false
+  }
+  if (!changed) return false
+  try {
+    view.dispatch(tr)
+    return true
+  } catch (err) {
+    console.error('[notes] 固化列宽提交失败', err)
+    return false
+  }
+}
+
+let freezeAllTimer: number | undefined
+
+/** 编辑后的兜底：把新出现 / 粘贴进来的表格固化（加载中、拖动中跳过）。 */
+function scheduleFreezeAll() {
+  if (freezeAllTimer) return
+  freezeAllTimer = window.setTimeout(() => {
+    freezeAllTimer = undefined
+    if (loadingContent || columnDragState()?.dragging) return
+    freezeAllTableWidths()
+  }, 400)
+}
+
+/** 复位僵死的拖动状态：先补写列宽，再清 dragging（必要时连手柄一起清）。
+ *  返回是否真的复位过。 */
+function recoverStuckColumnDrag(resetHandle: boolean): boolean {
+  const view = editor.value?.view
+  const key = columnResizePluginKey()
+  if (!view || !key || !columnDragState()?.dragging) return false
+  try { commitDomColumnWidths() } catch { /* 补写失败不阻塞复位 */ }
+  try {
+    view.dispatch(view.state.tr.setMeta(key as never,
+      resetHandle ? { setHandle: -1 } : { setDragging: null }))
+  } catch { return false }
+  return true
+}
+
+let freezeTimer: number | undefined
+
+/** 悬停到列边界后，等 prosemirror 把手柄位置算完（同一轮事件里它还拿不到），再固化列宽。
+ *  正常使用中悬停到按下之间总还有若干次 mousemove，所以能赶在拖动之前完成。 */
+function scheduleFreezeColumnWidths() {
+  if (freezeTimer) return
+  freezeTimer = window.setTimeout(() => {
+    freezeTimer = undefined
+    const state = columnDragState()
+    if (state && !state.dragging && state.activeHandle >= 0) freezeAllTableWidths()
+  }, 0)
+}
+
+function onWindowMouseMove(event: MouseEvent) {
+  // 左键没按下却还停在 dragging：上一轮的 mouseup 丢了，就地复位
+  if (event.buttons !== 0) return
+  const state = columnDragState()
+  if (state?.dragging) { recoverStuckColumnDrag(false); return }
+  // 悬停到列边界：把手柄所在表的列宽固化，之后拖动只改目标列
+  if (state && state.activeHandle >= 0) scheduleFreezeColumnWidths()
+}
+
+function onWindowMouseUp(event: MouseEvent) {
+  if (event.button !== 0) return
+  // 同一事件里 prosemirror 自己也在收尾，错开一个宏任务再判断是否残留
+  window.setTimeout(() => {
+    if (columnDragState()?.dragging) recoverStuckColumnDrag(false)
+  }, 0)
+}
+
+function onWindowBlur() {
+  recoverStuckColumnDrag(false)
+}
+
+function onDocumentMouseDownCapture() {
+  // 正常拖动期间不会有新的 mousedown；此时仍是 dragging 必然是上次没收尾，
+  // 连手柄一起清掉，避免下一次按下拖到错误的列
+  if (columnDragState()?.dragging) recoverStuckColumnDrag(true)
+}
 
 const activeNote = computed(() => {
   for (const b of books.value) {
@@ -276,7 +544,11 @@ function onTableMenuSelect(key: string | number) {
   const ed = editor.value
   if (!ed) return
   const c = () => ed.chain().focus()
-  if (key === 'insert') c().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
+  if (key === 'insert') {
+    c().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
+    // 插入后立刻固化列宽：否则第一次拖列时其他列会跟着变
+    void nextTick(() => freezeAllTableWidths())
+  }
   else if (key === 'row-before') c().addRowBefore().run()
   else if (key === 'row-after') c().addRowAfter().run()
   else if (key === 'col-before') c().addColumnBefore().run()
@@ -679,7 +951,11 @@ async function openNote(id: number) {
     revision.value = d.revision
     loadingContent = true
     const doc = d.content_json ? JSON.parse(d.content_json) : ''
-    editor.value?.commands.setContent(doc || '')
+    editor.value?.commands.setContent(sanitizeTableCells(doc) || '')
+    // 等两帧，确保容器与表格完成布局再固化（否则会读到 25px 的最小列宽）
+    await nextTick()
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    if (!disposed && activeId.value === id) freezeAllTableWidths()
     loadingContent = false
     saveState.value = 'saved'
   } catch (e) {
@@ -778,77 +1054,19 @@ function onPickImage(event: Event) {
   input.value = ''
 }
 
-/** 超过 5 MiB 的位图等比缩放 + 质量递减；透明图保留 PNG，GIF 不动（会丢帧）。 */
-async function compressImage(file: File): Promise<File> {
-  if (file.type === 'image/gif') return file
-  let bitmap: ImageBitmap
-  try {
-    bitmap = await createImageBitmap(file)
-  } catch {
-    return file                        // 不支持解码时退回原图，由后端 10 MB 兜底
-  }
-  try {
-    const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height))
-    const w = Math.max(1, Math.round(bitmap.width * scale))
-    const h = Math.max(1, Math.round(bitmap.height * scale))
-    const canvas = document.createElement('canvas')
-    canvas.width = w
-    canvas.height = h
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return file
-    ctx.drawImage(bitmap, 0, 0, w, h)
-    let hasAlpha = false
-    if (file.type === 'image/png' || file.type === 'image/webp') {
-      const rgba = ctx.getImageData(0, 0, w, h).data
-      for (let i = 3; i < rgba.length; i += 4) {
-        if (rgba[i] < 255) { hasAlpha = true; break }
-      }
-    }
-    const mime = hasAlpha ? 'image/png' : 'image/jpeg'
-    let quality = 0.85
-    let blob: Blob | null = null
-    for (let attempt = 0, attempts = hasAlpha ? 1 : 6; attempt < attempts; attempt++) {
-      blob = await new Promise<Blob | null>(resolve =>
-        canvas.toBlob(resolve, mime, hasAlpha ? undefined : quality))
-      if (blob && blob.size <= COMPRESS_THRESHOLD) break
-      quality -= 0.12
-      if (quality < 0.3) break
-    }
-    if (!blob || blob.size > BACKEND_LIMIT) return file
-    const ext = IMAGE_MIME_EXT[mime]
-    return new File([blob], (file.name.replace(/\.[^.]+$/, '') || 'image') + '.' + ext,
-                    { type: mime })
-  } finally {
-    bitmap.close()
-  }
-}
-
 async function insertImageFile(file: File, noteId: number, anchor?: number): Promise<boolean> {
   if (!IMAGE_MIME_EXT[file.type]) {
     message.warning('已忽略 1 张不受支持的图片（仅 png / jpg / gif / webp）')
     return false
   }
-  let target = file
-  if (file.size > COMPRESS_THRESHOLD) {
-    try {
-      target = await compressImage(file)
-    } catch (e) {
-      message.warning('图片压缩失败，改用原图：' + String(e))
-    }
-  }
-  if (target.size > BACKEND_LIMIT) {
-    message.warning(`图片超过 10 MB 上限，已跳过：${target.name}`)
+  // 压缩 + base64 + 上传统一在 utils/image：与业务记录富文本共用同一套阈值与实现
+  let uploaded: { url: string }
+  try {
+    uploaded = await uploadImageFile(file, `/api/notes/${noteId}/images`)
+  } catch (e) {
+    message.warning('图片上传失败：' + String((e as Error)?.message ?? e))
     return false
   }
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(new Error('读取图片失败'))
-    reader.readAsDataURL(target)
-  })
-  const r = await api<{ url: string }>(`/api/notes/${noteId}/images`, {
-    method: 'POST', body: JSON.stringify({ data: dataUrl, name: target.name }),
-  })
   // 上传是异步的；期间若已切页或组件卸载，绝不把图插进新页面
   if (disposed || activeId.value !== noteId || !editor.value) return false
   // 显式位置插入：setImage 是 setNode（替换当前节点），insertContent 在
@@ -857,7 +1075,7 @@ async function insertImageFile(file: File, noteId: number, anchor?: number): Pro
   const ed = editor.value
   const max = ed.state.doc.content.size
   const pos = anchor === undefined ? max : Math.min(anchor, max)
-  ed.chain().focus().insertContentAt(pos, { type: 'image', attrs: { src: r.url } }).run()
+  ed.chain().focus().insertContentAt(pos, { type: 'image', attrs: { src: uploaded.url } }).run()
   return true
 }
 
@@ -896,29 +1114,6 @@ function handlePasteImage(event: ClipboardEvent): boolean {
   event.preventDefault()
   for (const f of files) enqueueImage(f, noteId, anchor)
   return true
-}
-
-function normalizeMime(blob: Blob, src: string): string {
-  if (IMAGE_MIME_EXT[blob.type]) return blob.type
-  const m = /\.(png|jpe?g|gif|webp)(?:[?#]|$)/i.exec(src)
-  if (!m) return ''
-  const ext = m[1].toLowerCase()
-  return ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/' + ext
-}
-
-function dataUrlToFile(src: string): File | null {
-  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(src)
-  if (!m) return null
-  const mime = m[1].toLowerCase()
-  if (!IMAGE_MIME_EXT[mime]) return null   // svg+xml 等一律不接（后端魔数也会拒）
-  try {
-    const bin = atob(m[2].replace(/\s/g, ''))
-    const bytes = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-    return new File([bytes], 'pasted.' + IMAGE_MIME_EXT[mime], { type: mime })
-  } catch {
-    return null
-  }
 }
 
 /** 外链图尝试前端转存；CORS / 404 等失败时按约定降级忽略并提示。 */
@@ -1036,7 +1231,21 @@ watch([title, isPrivate], () => {
   if (detail.value && !loadingContent) markDirty()
 })
 
+/** 记住当前选中态：切到别的页签再回来时，onMounted 用它恢复分区与页面。 */
+watch([activeBookId, activeSectionId, activeId], ([bookId, sectionId, noteId]) => {
+  viewState.setNotes({ bookId, sectionId, noteId })
+})
+
 onMounted(async () => {
+  // 列宽拖动的兜底：mousemove 捕获阶段先于编辑器处理，便于及时发现僵死状态
+  window.addEventListener('mousemove', onWindowMouseMove, true)
+  window.addEventListener('mouseup', onWindowMouseUp)
+  window.addEventListener('blur', onWindowBlur)
+  document.addEventListener('mousedown', onDocumentMouseDownCapture, true)
+  // 会话内切页签回来：先把上次的笔记本 / 分区回填，再让 loadTree 校验它们是否还在
+  const saved = { ...viewState.notes }
+  if (saved.bookId) activeBookId.value = saved.bookId
+  if (saved.sectionId) activeSectionId.value = saved.sectionId
   await loadTree()
   // 页签栏宽度变化（窗口缩放 / 侧栏折叠）后重新决定谁进「更多」
   await nextTick()
@@ -1044,17 +1253,36 @@ onMounted(async () => {
     tabObserver = new ResizeObserver(() => { void measureTabs() })
     tabObserver.observe(tabsEl.value)
   }
-  // 支持 ?tab=notes&note=<id> 深链接（跨页跳转与 headless 截图用）
+  // 优先深链接，其次跨页跳转，最后才是"回到上次看的页面"
   const noteParam = new URLSearchParams(window.location.search).get('note')
-  if (noteParam && /^\d+$/.test(noteParam)) await focusNote(Number(noteParam))
-  // 项目工作台「记事本」页签点标题跳过来：store 里带目标页 id
   const pendingNote = jump.consumeNoteId()
-  if (pendingNote) await focusNote(pendingNote)
+  if (noteParam && /^\d+$/.test(noteParam)) {
+    await focusNote(Number(noteParam))
+  } else if (pendingNote) {
+    await focusNote(pendingNote)
+  } else if (saved.noteId) {
+    // 页面可能已被删除：残留 id 直接清掉，只保留分区
+    if (locateNote(saved.noteId)) await openNote(saved.noteId)
+    else viewState.setNotes({ noteId: null })
+  }
 })
 onBeforeUnmount(() => {
   disposed = true
+  // 自动保存是 1s 防抖，切页签快于 1s 时最后一段编辑会丢：先落盘再销毁编辑器。
+  // save() 在第一个 await 之前同步读取 editor.getJSON()，所以必须排在 destroy 前调用。
+  if (saveTimer) {
+    window.clearTimeout(saveTimer)
+    saveTimer = undefined
+  }
+  if (saveState.value === 'dirty') void save()
+  window.removeEventListener('mousemove', onWindowMouseMove, true)
+  window.removeEventListener('mouseup', onWindowMouseUp)
+  window.removeEventListener('blur', onWindowBlur)
+  document.removeEventListener('mousedown', onDocumentMouseDownCapture, true)
   tabObserver?.disconnect()
   if (saveTimer) window.clearTimeout(saveTimer)
+  if (freezeTimer) window.clearTimeout(freezeTimer)
+  if (freezeAllTimer) window.clearTimeout(freezeAllTimer)
   editor.value?.destroy()
 })
 </script>

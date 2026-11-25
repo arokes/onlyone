@@ -52,33 +52,40 @@ AUTO_MIN_FREE_PAGES = _env_int("ONLYONE_COMPACT_MIN_FREE_PAGES", 4000)
 AUTO_MIN_INTERVAL_SEC = _env_int("ONLYONE_COMPACT_MIN_INTERVAL_SEC", 3600)
 
 
-def stats(conn: sqlite3.Connection | None = None) -> dict:
-    """返回体积与碎片指标（MB）。"""
+def stats(conn: sqlite3.Connection | None = None, *, include_counts: bool = True) -> dict:
+    """返回体积与碎片指标（MB）。
+
+    ``include_counts=False`` 跳过 fts / 语义表的行数统计——那三条是大表扫描
+    （113 MB 库实测 160ms 以上），概览页只要体积指标，不该为此付首屏延迟。
+    """
     own = conn is None
     conn = conn or connect()
     try:
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
         page_count = conn.execute("PRAGMA page_count").fetchone()[0]
         free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
-        fts_rows = conn.execute(
-            "SELECT count(DISTINCT entry_id) FROM fts_entries").fetchone()[0]
-        fts_chunks = conn.execute("SELECT count(*) FROM fts_entries").fetchone()[0]
-        semantic_rows = conn.execute("SELECT count(*) FROM semantic_index").fetchone()[0]
+        if include_counts:
+            fts_rows = conn.execute(
+                "SELECT count(DISTINCT entry_id) FROM fts_entries").fetchone()[0]
+            fts_chunks = conn.execute("SELECT count(*) FROM fts_entries").fetchone()[0]
+            semantic_rows = conn.execute(
+                "SELECT count(*) FROM semantic_index").fetchone()[0]
     finally:
         if own:
             conn.close()
     total = page_count * page_size
     free = free_pages * page_size
-    return {
+    result = {
         "file_mb": round(_file_mb(DB_PATH), 2),
         "used_mb": round((total - free) / 1048576, 2),
         "free_mb": round(free / 1048576, 2),
         "free_pages": free_pages,
         "free_ratio": round(free / total, 3) if total else 0.0,
-        "entries": fts_rows,
-        "fts_chunks": fts_chunks,
-        "semantic_rows": semantic_rows,
     }
+    if include_counts:
+        result.update({"entries": fts_rows, "fts_chunks": fts_chunks,
+                       "semantic_rows": semantic_rows})
+    return result
 
 
 def _file_mb(path: Path) -> float:
