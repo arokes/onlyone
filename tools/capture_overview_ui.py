@@ -175,6 +175,10 @@ def main() -> int:
         search_dom = dump_dom(base + "/?token=" + TOKEN + "&tab=search", profile)
         check("?tab=search 深链接仍落在搜索页",
               "待跟进运维" not in search_dom and "搜索文件正文" in search_dom)
+        check("搜索页无关键词时是中性空态",
+              "输入关键词开始搜索" in search_dom
+              and "还没有可搜索的内容" not in search_dom
+              and "去添加索引目录" not in search_dom)
 
         ok = all(results)
         print("\n%s  (%d/%d) -> %s" % ("ALL PASS" if ok else "SOME FAILED",

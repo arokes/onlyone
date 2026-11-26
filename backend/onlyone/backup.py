@@ -81,6 +81,8 @@ def export_credentials(body: ExportIn):
             "password": decrypt(row["password_enc"]),
             "url": decrypt(row["url_enc"]),
             "note": decrypt(row["note_enc"]),
+            # 动态码密钥也进密文：否则换机恢复后 TOTP 全丢（2026-11-25）
+            "totp": decrypt(row["totp_enc"]) if row["totp_enc"] else "",
             "project_id": row["project_id"],
             "sap_conn": row.get("sap_conn") or "",
         } for row in rows]
@@ -131,13 +133,15 @@ def import_credentials(body: ImportIn):
                 continue
             conn.execute(
                 """INSERT INTO credentials
-                   (title,username_enc,password_enc,url_enc,note_enc,project_id,sap_conn,updated_at)
-                   VALUES(?,?,?,?,?,?,?,datetime('now','localtime'))""",
+                   (title,username_enc,password_enc,url_enc,note_enc,totp_enc,
+                    project_id,sap_conn,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,datetime('now','localtime'))""",
                 (str(item.get("title") or "未命名凭据"),
                  encrypt(str(item.get("username") or "")),
                  encrypt(str(item.get("password") or "")),
                  encrypt(str(item.get("url") or "")),
                  encrypt(str(item.get("note") or "")),
+                 encrypt(str(item.get("totp") or "")) if item.get("totp") else None,
                  item.get("project_id"),
                  str(item.get("sap_conn") or "")),
             )

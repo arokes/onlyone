@@ -13,6 +13,7 @@ import { EditorContent, useEditor } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import TiptapImage from '@tiptap/extension-image'
 import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table'
+import { WikiLink } from '@/utils/wikiLink'
 import {
   NButton, NDropdown, NInput, NInputNumber, NModal, NSelect, NSwitch, NTag,
   useDialog, useMessage,
@@ -47,6 +48,41 @@ const renamingValue = ref('')
 const bookMenuShow = ref(false)
 const activeId = ref<number | null>(null)
 const detail = ref<NoteDetail | null>(null)
+
+/* —— 双链：出链 / 反链（2026-11-25） —— */
+interface WikiLinks {
+  outlinks: { title: string; note_id: number | null }[]
+  backlinks: { note_id: number; title: string; section: string; snippet: string }[]
+}
+const links = ref<WikiLinks>({ outlinks: [], backlinks: [] })
+
+async function loadLinks(noteId: number) {
+  try {
+    links.value = await api<WikiLinks>(`/api/notes/${noteId}/links`)
+  } catch {
+    // 链接面板读不出来不影响编辑
+    links.value = { outlinks: [], backlinks: [] }
+  }
+}
+
+/** 点击正文里的 [[...]] 或右侧出链：按标题找页面，找不到就提示（不自动建页，避免误建） */
+async function openWiki(title: string) {
+  const name = String(title || '').trim()
+  if (!name) return
+  try {
+    const hit = await api<{ note_id: number | null }>(
+      '/api/note-lookup?title=' + encodeURIComponent(name))
+    if (hit.note_id) await openNote(hit.note_id)
+    else message.info(`「${name}」还没有对应页面，可在记事本里新建同名页面`)
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+function onWikiOpen(event: Event) {
+  const detailData = (event as CustomEvent<{ title?: string }>).detail
+  if (detailData?.title) void openWiki(detailData.title)
+}
 const title = ref('')
 const isPrivate = ref(false)
 const revision = ref(0)
@@ -106,6 +142,8 @@ const editor = useEditor({
     TableRow,
     TableHeader,
     TableCell,
+    // [[页面标题]] 的虚线下划线 + 点击跳转（只做装饰，不改文档结构）
+    WikiLink,
   ],
   content: '',
   editorProps: {
@@ -924,6 +962,7 @@ async function save() {
     revision.value = r.revision
     saveState.value = 'saved'
     await loadTree()
+    if (activeId.value) void loadLinks(activeId.value)
   } catch (e) {
     saveState.value = 'dirty'
     message.error('保存失败（可能 revision 冲突，请重新打开页面）：' + String(e))
@@ -958,6 +997,7 @@ async function openNote(id: number) {
     if (!disposed && activeId.value === id) freezeAllTableWidths()
     loadingContent = false
     saveState.value = 'saved'
+    void loadLinks(id)
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -1238,6 +1278,7 @@ watch([activeBookId, activeSectionId, activeId], ([bookId, sectionId, noteId]) =
 
 onMounted(async () => {
   // 列宽拖动的兜底：mousemove 捕获阶段先于编辑器处理，便于及时发现僵死状态
+  window.addEventListener('onlyone:wiki-open', onWikiOpen)
   window.addEventListener('mousemove', onWindowMouseMove, true)
   window.addEventListener('mouseup', onWindowMouseUp)
   window.addEventListener('blur', onWindowBlur)
@@ -1268,6 +1309,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   disposed = true
+  window.removeEventListener('onlyone:wiki-open', onWikiOpen)
   // 自动保存是 1s 防抖，切页签快于 1s 时最后一段编辑会丢：先落盘再销毁编辑器。
   // save() 在第一个 await 之前同步读取 editor.getJSON()，所以必须排在 destroy 前调用。
   if (saveTimer) {
@@ -1442,6 +1484,24 @@ onBeforeUnmount(() => {
           </span>
         </div>
         <editor-content :editor="editor" class="tiptap" />
+
+        <div v-if="links.outlinks.length || links.backlinks.length" class="wiki-panel">
+          <div class="wiki-col">
+            <div class="wiki-title">本页引用 <span class="count-chip">{{ links.outlinks.length }}</span></div>
+            <div v-for="o in links.outlinks" :key="'out-' + o.title" class="wiki-item"
+                 :class="{ pending: !o.note_id }" @click="openWiki(o.title)">
+              {{ o.title }}<span v-if="!o.note_id" class="wiki-pending">待建</span>
+            </div>
+          </div>
+          <div class="wiki-col">
+            <div class="wiki-title">反向链接 <span class="count-chip">{{ links.backlinks.length }}</span></div>
+            <div v-for="b in links.backlinks" :key="'in-' + b.note_id" class="wiki-item"
+                 @click="openNote(b.note_id)">
+              <div class="wiki-name">{{ b.title }}</div>
+              <div v-if="b.snippet" class="wiki-snippet">{{ b.snippet }}</div>
+            </div>
+          </div>
+        </div>
       </template>
     </section>
     </div>
@@ -1573,6 +1633,32 @@ onBeforeUnmount(() => {
 .image-btn { font-size: 12px; color: var(--info-deep); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px 8px; cursor: pointer; }
 .tiptap { flex: 1 1 auto; min-height: 0; border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius-sm); padding: 20px 24px; overflow-y: auto; }
 .tiptap :deep(.tiptap-body) { outline: none; min-height: 300px; font-size: 16px; line-height: 1.8; }
+.tiptap :deep(.wiki-link) {
+  color: var(--accent-strong);
+  border-bottom: 1px dashed var(--accent);
+  cursor: pointer;
+}
+.tiptap :deep(.wiki-link:hover) { background: var(--accent-soft); }
+
+.wiki-panel {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line-soft);
+}
+.wiki-col { min-width: 0; }
+.wiki-title { font-size: 12px; color: var(--ink-3); margin-bottom: 6px; }
+.wiki-item {
+  padding: 4px 6px; border-radius: var(--r-xs); cursor: pointer;
+  font-size: 12px; color: var(--ink-2);
+}
+.wiki-item:hover { background: var(--paper-2); }
+.wiki-item.pending { color: var(--ink-3); }
+.wiki-pending { margin-left: 6px; font-size: 11px; color: var(--warn); }
+.wiki-name { color: var(--info-deep); }
+.wiki-snippet {
+  font-size: 11px; color: var(--ink-3); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@media (max-width: 900px) { .wiki-panel { grid-template-columns: 1fr; } }
 /* 阅读版心：正文与表格统一 720 居中；图片是唯一允许变宽的元素（见下一条） */
 .tiptap :deep(.tiptap-body) > :not(img) { max-width: 720px; margin-inline: auto; }
 .tiptap :deep(h1), .tiptap :deep(h2), .tiptap :deep(h3) { font-weight: 600; margin: 20px 0 8px; }

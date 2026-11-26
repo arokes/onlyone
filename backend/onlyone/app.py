@@ -17,9 +17,13 @@ from . import __version__, backends, ocr, watcher
 from .attachments import router as attach_router
 from .backup import router as backup_router
 from .business import router as biz_router
+from .capture import router as capture_router
 from .credentials import router as cred_router
+from .duplicates import router as dup_router
 from .notes import router as notes_router
 from .overview import router as overview_router
+from .saved_views import router as views_router
+from .tags import router as tags_router
 from .db import PROJECT_ROOT, connect, init_db
 from .scanner import (
     MAX_ATTEMPTS, progress_snapshot, root_write_lock, scan_root, start_scan_job,
@@ -190,6 +194,10 @@ def create_app(token: str) -> FastAPI:
     app.include_router(notes_router)  # M7：记事本 / 图片 / 导出 / 全库备份
     app.include_router(backup_router) # M7：凭据加密导出与导入（C 方案）
     app.include_router(overview_router)  # 2026-11-25：概览页聚合（只读）
+    app.include_router(dup_router)       # 2026-11-25：重复文件报告（只读、按哈希聚合）
+    app.include_router(views_router)     # 2026-11-25：保存视图（app_meta，不建表）
+    app.include_router(tags_router)      # 2026-11-25：用户标签（entries.user_tags）
+    app.include_router(capture_router)   # 2026-11-25：快速捕获（热键唤起的小窗写入）
 
     @app.middleware("http")
     async def token_guard(request: Request, call_next):
@@ -385,22 +393,41 @@ def create_app(token: str) -> FastAPI:
         return backends.status()
 
     @app.get("/api/search")
-    def search(q: str = ""):
-        """字面检索 + 语义候选 + 外部索引，三组结果独立返回、分数不混排。"""
+    def search(q: str = "", tag: str = ""):
+        """字面检索 + 语义候选 + 外部索引，三组结果独立返回、分数不混排。
+
+        ``tag``（2026-11-25）：按用户标签过滤。可以单独用（q 为空，列出该标签下全部条目），
+        也可以与关键词组合（先取字面命中，再与标签集合求交）。
+        """
         q = q.strip()
-        if not q:
-            return {"query": "", "mode": "none", "items": [],
+        tag = tag.strip()
+        if not q and not tag:
+            return {"query": "", "tag": "", "mode": "none", "items": [],
                     "semantic_items": [], "plugin_items": []}
         conn = _conn()
         try:
-            mode, ids = search_entries(conn, q)
+            if q:
+                mode, ids = search_entries(conn, q)
+            else:
+                mode, ids = "tag_filter", []
+            if tag:
+                tag_ids = [r[0] for r in conn.execute(
+                    """SELECT e.id FROM entries e, json_each(e.user_tags) j
+                       WHERE j.value=? ORDER BY e.updated_at DESC LIMIT 300""",
+                    (tag,))]
+                if q:
+                    allowed = set(tag_ids)
+                    ids = [eid for eid in ids if eid in allowed]
+                else:
+                    ids = tag_ids
             items = _items_by_ids(conn, ids, q)
             # C 方案：标题命中的结果置顶，其次按正文命中次数降序
             items.sort(key=lambda it: (0 if it.get("hit_in_title") else 1,
                                       -int(it.get("hit_count") or 0)))
 
-            # M6-2：排除字面已命中的条目，避免重复；按向量分数排序
-            candidates = semantic_candidates(conn, q, exclude_ids=set(ids))
+            # M6-2：排除字面已命中的条目，避免重复；按向量分数排序。
+            # 纯标签过滤（q 为空）没有向量查询的意义，直接跳过。
+            candidates = semantic_candidates(conn, q, exclude_ids=set(ids)) if q else []
             score_map = dict(candidates)
             semantic_items = _items_by_ids(conn, [eid for eid, _ in candidates], q)
             for item in semantic_items:
@@ -411,8 +438,8 @@ def create_app(token: str) -> FastAPI:
             conn.close()
 
         # M6-3：外部索引只读、默认关闭、独立分组
-        plugin_items = plugin_candidates(q)
-        return {"query": q, "mode": mode, "items": items,
+        plugin_items = plugin_candidates(q) if q else []
+        return {"query": q, "tag": tag, "mode": mode, "items": items,
                 "semantic_items": semantic_items, "plugin_items": plugin_items}
 
     @app.post("/api/open")

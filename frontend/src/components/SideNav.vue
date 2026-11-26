@@ -3,12 +3,30 @@
  * 左侧一级导航（v0.8）：替代原顶部页签。
  * 垂直排布不再需要溢出下拉，按「知识 / 业务 / 系统」分组，底部显示运行形态与版本。
  */
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { api } from '@/api/client'
 
 interface NavItem { key: string; label: string; group?: string }
 
 const props = defineProps<{ items: NavItem[]; active: string; version: string }>()
 const emit = defineEmits<{ (e: 'update:active', key: string): void }>()
+
+// 全局热键状态：不可用时在这里说明，而不是只写进日志（用户 2026-11-25 反馈过 1409）
+interface HotkeyState { enabled: boolean; hotkey: string; error: string }
+const hotkey = ref<HotkeyState | null>(null)
+
+const prettyHotkey = computed(() =>
+  (hotkey.value?.hotkey ?? '').split('+')
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join('+'))
+
+onMounted(async () => {
+  try {
+    hotkey.value = await api<HotkeyState>('/api/hotkey/status')
+  } catch {
+    hotkey.value = null
+  }
+})
 
 const GROUP_ORDER = ['知识', '业务', '系统']
 
@@ -65,6 +83,10 @@ const groups = computed(() => {
     <div class="footer">
       <div><span class="dot" />本地运行 · 无云端依赖</div>
       <div>{{ props.version }}</div>
+      <div v-if="hotkey" class="hotkey-line" :class="{ warn: !hotkey.enabled }"
+           :title="hotkey.enabled ? 'Ctrl+Alt+Space 唤起快速捕获' : (hotkey.error || '热键未注册')">
+        {{ hotkey.enabled ? '热键 ' + prettyHotkey : '热键不可用' }}
+      </div>
     </div>
   </aside>
 </template>
@@ -128,6 +150,8 @@ const groups = computed(() => {
 }
 .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
 .nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.footer .hotkey-line { color: var(--ink-3); cursor: default; }
+.footer .hotkey-line.warn { color: var(--warn); }
 .footer {
   padding: 10px 14px 12px;
   border-top: 1px solid var(--line-soft);

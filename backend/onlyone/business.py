@@ -143,7 +143,7 @@ def list_biz(kind: str, project_id: int | None = None):
     entity = _entity(kind)
     conn = connect()
     try:
-        sql = (f"SELECT b.*, e.id AS entry_id FROM {entity.table} b "
+        sql = (f"SELECT b.*, e.id AS entry_id, e.user_tags FROM {entity.table} b "
                "LEFT JOIN entries e ON e.type=? AND e.ref_id=b.id")
         params: list[Any] = [entity.type]
         if project_id is not None and "project_id" in entity.columns:

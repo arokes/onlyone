@@ -46,6 +46,7 @@ function setRange(key: string, index: 0 | 1, value: string | null) {
 
 <template>
   <div class="filter-bar">
+    <slot name="views" />
     <template v-for="f in filters" :key="f.key">
       <n-input
         v-if="f.type === 'keyword' || f.type === 'text'"

@@ -118,6 +118,11 @@ tr.row-overdue > td { background: var(--warn-soft); }
 tr.row-overdue:hover > td { background: var(--warn-soft); }
 tr.row-overdue > td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 
+/* 快速捕获模式（2026-11-25）：热键触发时后端把主窗口缩成卡片。
+   这里**不隐藏工作台**——曾用 `display:none` 结果浮层一旦没渲染出来就只剩一片背景色；
+   改由浮层自己的不透明遮罩盖住，浮层异常时至少还能看到并操作界面。 */
+body.capture-mode { background: var(--paper); }
+
 /* 只读文本块（预览正文 / 命中片段）用暖纸色，避免冷灰割裂 */
 .paper-block {
   background: var(--paper-2);

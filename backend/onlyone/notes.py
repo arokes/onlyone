@@ -884,6 +884,87 @@ def create_project_note(project_id: int, body: ProjectNoteIn):
         conn.close()
 
 
+# ---------------------------------------------------------------- 双链（2026-11-25）
+# 语法沿用 Obsidian：正文里写 [[页面标题]]。不改 content_json 结构，只在纯文本上解析，
+# 因此老页面、导入的 MHT、导出 Markdown 都不受影响（导出的就是原始方括号文本）。
+WIKI_RE = re.compile(r"\[\[([^\[\]\n]{1,80})\]\]")
+
+
+def _wiki_titles(content_json: Any) -> list[str]:
+    """从正文里按出现顺序取出去重后的链接标题。"""
+    text = rich.extract_text(content_json)
+    titles: list[str] = []
+    for match in WIKI_RE.finditer(text):
+        title = match.group(1).strip()
+        if title and title not in titles:
+            titles.append(title)
+    return titles
+
+
+@router.get("/api/note-lookup")
+def lookup_note(title: str):
+    """按标题找页面：重名时取最近更新的一个。找不到返回 note_id=None（待建链接）。"""
+    name = (title or "").strip()
+    if not name:
+        return {"note_id": None, "title": ""}
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT id, is_private FROM notes WHERE title=? "
+            "ORDER BY updated_at DESC LIMIT 1", (name,)).fetchone()
+        return {"note_id": row["id"] if row else None,
+                "is_private": bool(row["is_private"]) if row else False,
+                "title": name}
+    finally:
+        conn.close()
+
+
+@router.get("/api/notes/{note_id}/links")
+def note_links(note_id: int):
+    """出链 + 反链。反链只统计非私密页，避免私密页标题通过反链泄漏。"""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT id, title, content_json, is_private FROM notes WHERE id=?",
+            (note_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "页面不存在")
+
+        outlinks = []
+        for title in _wiki_titles(row["content_json"]):
+            hit = conn.execute(
+                "SELECT id FROM notes WHERE title=? ORDER BY updated_at DESC LIMIT 1",
+                (title,)).fetchone()
+            outlinks.append({"title": title, "note_id": hit["id"] if hit else None})
+
+        backlinks = []
+        title = str(row["title"] or "").strip()
+        if title and not row["is_private"]:
+            needle = "[[" + title + "]]"
+            for src in conn.execute(
+                """SELECT n.id, n.title, s.name AS section, n.content_json
+                   FROM notes n JOIN sections s ON s.id = n.section_id
+                   WHERE n.id <> ? AND n.is_private = 0 AND n.content_json LIKE ?
+                   ORDER BY n.updated_at DESC LIMIT 30""",
+                (note_id, "%" + needle + "%"),
+            ):
+                plain = rich.extract_text(src["content_json"])
+                at = plain.find(needle)
+                snippet = ""
+                if at >= 0:
+                    start = max(0, at - 24)
+                    snippet = plain[start: at + len(needle) + 26].replace("\n", " ").strip()
+                backlinks.append({
+                    "note_id": src["id"],
+                    "title": src["title"],
+                    "section": src["section"],
+                    "snippet": snippet,
+                })
+        return {"outlinks": outlinks, "backlinks": backlinks}
+    finally:
+        conn.close()
+
+
 @router.get("/api/notes/{note_id}")
 def get_note(note_id: int):
     conn = connect()
@@ -986,23 +1067,17 @@ def delete_note(note_id: int):
 # 魔数判定统一在 attachments.image_ext（业务记录上传用的也是它），此处不再重复实现
 
 
-@router.post("/api/notes/{note_id}/images")
-def upload_image(note_id: int, body: ImageIn):
-    """base64 上传（无需 python-multipart）；校验魔数，避免伪装脚本文件。
+def _write_inline_image(note_id: int, data_url: str) -> dict:
+    """把 data:image/... 落盘为附件，返回 url / filename / size / dedup。
 
-    文件名 = ``sha256(raw)[:32].<ext>``，命中既有文件即复用（页内去重），
-    返回 ``dedup`` 标明是否为复用。
+    upload_image 与快速捕获共用这一份逻辑。文件名 = sha256 前 32 位，
+    天然幂等；去重范围限定在 note_id 目录内（删页会 rmtree 整个目录，
+    跨页复用会导致删 A 页时把 B 页的图一起删掉）。
     """
-    conn = connect()
-    try:
-        if not conn.execute("SELECT 1 FROM notes WHERE id=?", (note_id,)).fetchone():
-            raise HTTPException(404, "页面不存在")
-    finally:
-        conn.close()
-    if not body.data.startswith("data:image/"):
+    if not data_url.startswith("data:image/"):
         raise HTTPException(400, "只接受 data:image/ 开头的图片")
     try:
-        _, encoded = body.data.split(",", 1)
+        _, encoded = data_url.split(",", 1)
         raw = base64.b64decode(encoded, validate=True)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, "图片数据不是合法 base64") from exc
@@ -1011,9 +1086,6 @@ def upload_image(note_id: int, body: ImageIn):
     ext = image_ext(raw)
     if ext is None:
         raise HTTPException(400, "不支持的图片格式（仅 png/jpg/gif/webp）")
-    # 文件名即内容哈希（前 32 位 hex）——仍满足 SAFE_FILENAME 白名单，且天然幂等：
-    # 同一页面重复粘贴同一张图只落一份文件。去重范围刻意限定在 note_id 目录内，
-    # 因为删页会 rmtree 整个目录，跨页复用会让删 A 页时把 B 页的图一起删掉。
     filename = "%s.%s" % (hashlib.sha256(raw).hexdigest()[:32], ext)
     folder = ATTACH_DIR / str(note_id)
     folder.mkdir(parents=True, exist_ok=True)
@@ -1023,6 +1095,46 @@ def upload_image(note_id: int, body: ImageIn):
         target.write_bytes(raw)
     return {"url": "/api/attachments/%d/%s" % (note_id, filename),
             "filename": filename, "size": len(raw), "dedup": dedup}
+
+
+def persist_inline_images(note_id: int, doc: Any) -> int:
+    """就地替换 ProseMirror 文档里的 data:image 内联图，返回替换数量。
+
+    快速捕获窗口支持直接 Ctrl+V 截图：编辑器先把图片以 base64 嵌在文档里，
+    保存时才落盘（此时才有 note_id），避免"先建空页再上传"的两段式。
+    """
+    replaced = 0
+
+    def walk(node: Any) -> None:
+        nonlocal replaced
+        if isinstance(node, dict):
+            if node.get("type") == "image":
+                attrs = node.get("attrs") or {}
+                src = str(attrs.get("src") or "")
+                if src.startswith("data:image/"):
+                    attrs["src"] = _write_inline_image(note_id, src)["url"]
+                    node["attrs"] = attrs
+                    replaced += 1
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(doc)
+    return replaced
+
+
+@router.post("/api/notes/{note_id}/images")
+def upload_image(note_id: int, body: ImageIn):
+    """base64 上传（无需 python-multipart）；校验魔数，避免伪装脚本文件。"""
+    conn = connect()
+    try:
+        if not conn.execute("SELECT 1 FROM notes WHERE id=?", (note_id,)).fetchone():
+            raise HTTPException(404, "页面不存在")
+    finally:
+        conn.close()
+    return _write_inline_image(note_id, body.data)
 
 
 @router.get("/api/attachments/{note_id}/{filename}")

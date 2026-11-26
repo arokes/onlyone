@@ -11,9 +11,13 @@ import {
 import type { GlobalThemeOverrides } from 'naive-ui'
 import { storeToRefs } from 'pinia'
 import SideNav from '@/components/SideNav.vue'
+import CaptureOverlay from '@/components/CaptureOverlay.vue'
 import SetupWizard from '@/components/SetupWizard.vue'
 import { api } from '@/api/client'
 import { useJumpStore } from '@/stores/jump'
+
+// 独立捕获小窗（?capture=1）：只渲染浮层，不挂应用壳与任何页面
+const captureOnly = new URLSearchParams(window.location.search).get('capture') === '1'
 
 const HomeView = defineAsyncComponent(() => import('@/views/HomeView.vue'))
 const SearchView = defineAsyncComponent(() => import('@/views/SearchView.vue'))
@@ -132,7 +136,7 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
   <n-config-provider :locale="zhCN" :date-locale="dateZhCN" :theme-overrides="themeOverrides">
     <n-message-provider>
       <n-dialog-provider>
-        <div class="app">
+        <div v-if="!captureOnly" class="app">
           <side-nav
             :items="navItems" :active="activeTab" version="v0.8 · 暖纸主题"
             @update:active="activeTab = $event"
@@ -155,7 +159,12 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
             </template>
           </main>
           <setup-wizard v-model:show="showSetup" />
+          <!-- 主窗口不再挂载快速捕获浮层：热键只走独立小窗（?capture=1）。
+               之前两处都挂，主窗口那份也在轮询 /api/capture/pending，
+               于是热键一按主窗口里也弹一张卡片，要按 ESC 才消失（2026-11-26 用户反馈）。 -->
         </div>
+        <!-- 独立小窗模式：整页只有一张捕获卡片 -->
+        <capture-overlay v-else standalone />
       </n-dialog-provider>
     </n-message-provider>
   </n-config-provider>

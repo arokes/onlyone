@@ -195,7 +195,7 @@ INSERT INTO fts_entries(entry_id, title, body, tags)
     return JSON.stringify({
       drawerOpen: !!drawer && drawer.getBoundingClientRect().width > 0,
       groups: document.querySelectorAll('.group-title').length,
-      empty: document.body.innerText.includes('还没有可搜索的内容'),
+      empty: document.body.innerText.includes('输入关键词开始搜索'),
       hasTarget: document.body.innerText.includes(${JSON.stringify(expected)}),
     });
   })()`))

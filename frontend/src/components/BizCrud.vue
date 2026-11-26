@@ -5,7 +5,7 @@
  * 字段由 Field[] 配置驱动，避免四个页面重复实现。
  */
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
-import { NButton, NDataTable, NModal, useDialog, useMessage } from 'naive-ui'
+import { NButton, NDataTable, NDynamicTags, NInput, NModal, NSelect, useDialog, useMessage } from 'naive-ui'
 import type { DataTableColumns, SelectOption } from 'naive-ui'
 import { api } from '@/api/client'
 import BizFieldInput from './BizFieldInput.vue'
@@ -14,6 +14,7 @@ import EmptyState from './EmptyState.vue'
 import type { Field, FilterSpec } from './biz-types'
 import { useViewStateStore } from '@/stores/viewState'
 import { countImages, docToText } from '@/utils/richtext'
+import { parseTags } from '@/utils/tags'
 
 const props = defineProps<{
   kind: string
@@ -50,6 +51,8 @@ const showModal = ref(false)
 const saving = ref(false)
 const editingId = ref<number | null>(null)
 const form = reactive<Record<string, any>>({})
+/** 用户标签不属业务表，单独维护；保存时写 /api/entries/{id}/tags */
+const formTags = ref<string[]>([])
 const checkedRowKeys = ref<(string | number)[]>([])
 
 const projectOptions = computed(() =>
@@ -170,6 +173,112 @@ function onFilterUpdate(patch: Record<string, any>) {
   Object.assign(filterValues, patch)
 }
 
+// ---------------------------------------------------------------- 保存视图
+/** 视图存的是筛选值（不是结果），恢复时按当前数据重算，见 backend/onlyone/saved_views.py */
+interface SavedView { id: string; name: string; tab: string; filters: Record<string, any> }
+const views = ref<SavedView[]>([])
+const activeView = ref<string | null>(null)
+const showViewModal = ref(false)
+const viewName = ref('')
+
+const viewOptions = computed(() => views.value.map(v => ({ label: v.name, value: v.id })))
+
+async function loadViews() {
+  if (!props.filterKey) return
+  try {
+    views.value = await api<SavedView[]>('/api/views?tab=' + props.kind)
+  } catch {
+    // 视图读不出来不影响列表本身，静默即可
+  }
+}
+
+function applyView(id: string | null) {
+  activeView.value = id
+  resetFilterValues()
+  if (!id) return
+  const view = views.value.find(v => v.id === id)
+  if (!view) return
+  for (const spec of props.filters || []) {
+    if (spec.key in (view.filters || {})) filterValues[spec.key] = view.filters[spec.key]
+  }
+}
+
+/** 用当前条件拼一个默认名称，省得每次手输 */
+function defaultViewName(): string {
+  const parts: string[] = []
+  for (const spec of props.filters || []) {
+    if (spec.type === 'keyword' || spec.type === 'text') continue
+    const value = filterValues[spec.key]
+    if (value == null || value === '') continue
+    if (Array.isArray(value)) {
+      const kept = value.filter(Boolean)
+      if (kept.length) parts.push(kept.join(' ~ '))
+    } else {
+      const option = spec.options?.find(o => o.value === value)
+      parts.push(option ? option.label : String(value))
+    }
+    if (parts.length >= 3) break
+  }
+  return parts.slice(0, 3).join(' · ') || '我的视图'
+}
+
+function openSaveView() {
+  viewName.value = defaultViewName()
+  showViewModal.value = true
+}
+
+async function commitView() {
+  const name = viewName.value.trim()
+  if (!name) {
+    message.warning('请输入视图名称')
+    return
+  }
+  const filters: Record<string, any> = {}
+  for (const [key, value] of Object.entries(filterValues)) {
+    if (value == null || value === '') continue
+    if (Array.isArray(value)) {
+      const kept = value.filter(Boolean)
+      if (!kept.length) continue
+      filters[key] = kept
+    } else {
+      filters[key] = value
+    }
+  }
+  try {
+    const created = await api<SavedView>('/api/views', {
+      method: 'POST',
+      body: JSON.stringify({ name, tab: props.kind, filters }),
+    })
+    showViewModal.value = false
+    await loadViews()
+    activeView.value = created.id
+    message.success('已保存视图')
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+function removeView() {
+  const item = views.value.find(v => v.id === activeView.value)
+  if (!item) return
+  dialog.warning({
+    title: '删除视图',
+    content: `确认删除「${item.name}」？只删这组筛选条件，不影响任何记录。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await api('/api/views/' + item.id, { method: 'DELETE' })
+        activeView.value = null
+        await loadViews()
+        message.success('已删除视图')
+      } catch (e) {
+        message.error(String(e))
+      }
+    },
+  })
+}
+
 /** 已固定归属项目时，归属列既不显示也不让选，避免误改到别的项目 */
 const fixedProject = computed(() => typeof props.projectId === 'number' && props.projectId > 0)
 const visibleFields = computed(() =>
@@ -233,7 +342,10 @@ async function load() {
     loading.value = false
   }
 }
-onMounted(load)
+onMounted(() => {
+  load()
+  loadViews()
+})
 watch(() => props.projectId, () => {
   checkedRowKeys.value = []
   load()
@@ -260,6 +372,7 @@ function openCreate() {
   editingId.value = null
   Object.keys(form).forEach(k => delete form[k])
   Object.assign(form, blank())
+  formTags.value = []
   showModal.value = true
 }
 
@@ -268,6 +381,7 @@ function openEdit(row: Record<string, any>) {
   Object.keys(form).forEach(k => delete form[k])
   Object.assign(form, blank())
   for (const f of props.fields) form[f.key] = row[f.key] ?? null
+  formTags.value = parseTags(row.user_tags)
   showModal.value = true
 }
 
@@ -283,10 +397,22 @@ async function save() {
     for (const f of props.fields) data[f.key] = form[f.key] ?? null
     if (fixedProject.value) data.project_id = props.projectId
     const path = '/api/biz/' + props.kind + (editingId.value ? '/' + editingId.value : '')
-    await api(path, {
+    const saved = await api<{ id: number; entry_id: number }>(path, {
       method: editingId.value ? 'PUT' : 'POST',
       body: JSON.stringify({ data }),
     })
+    // 标签是挂在 entries 上的，业务记录写完再单独提交；失败不回滚记录，
+    // 但要明确告知，避免用户以为标签存住了。
+    if (saved?.entry_id) {
+      try {
+        await api('/api/entries/' + saved.entry_id + '/tags', {
+          method: 'PUT',
+          body: JSON.stringify({ tags: formTags.value }),
+        })
+      } catch (e) {
+        message.warning('记录已保存，但标签未能写入：' + String(e))
+      }
+    }
     showModal.value = false
     message.success('已保存')
     await load()
@@ -361,6 +487,19 @@ function cellValue(row: Record<string, any>, f: Field): string {
   if (raw == null || raw === '') return '—'
   const text = String(raw)
   return f.type === 'textarea' && text.length > 60 ? text.slice(0, 60) + '…' : text
+}
+
+/** 列表里的标签单元格：最多两枚，多余折成 +N */
+function renderTags(row: Record<string, any>) {
+  const tags = parseTags(row.user_tags)
+  if (!tags.length) return h('span', { class: 'muted' }, '—')
+  const shown = tags.slice(0, 2)
+  return h('div', { class: 'tag-cell' }, [
+    ...shown.map(tag => h('span', { class: 'tag-chip' }, tag)),
+    ...(tags.length > shown.length
+      ? [h('span', { class: 'tag-more' }, `+${tags.length - shown.length}`)]
+      : []),
+  ])
 }
 
 function toTsv(list: Record<string, any>[]): string {
@@ -483,6 +622,11 @@ const columns = computed<DataTableColumns>(() => {
     })
   }
   cols.push({
+    // 也固定在右侧：表格总宽超过容器时，放在中间会被固定操作列压住、看不见
+    title: '标签', key: '__tags', width: 120, fixed: 'right',
+    render: (row: any) => renderTags(row),
+  })
+  cols.push({
     title: '操作',
     key: '__actions',
     width: props.extra ? 230 : 160,
@@ -524,7 +668,19 @@ const columns = computed<DataTableColumns>(() => {
       :filters="filters" :values="filterValues" :options="filterOptions"
       :matched="filteredRows.length" :total="rows.length"
       @update="onFilterUpdate"
-    />
+    >
+      <template #views>
+        <n-select
+          v-if="views.length || activeView"
+          size="small" clearable placeholder="视图" style="width: 150px"
+          :value="activeView" :options="viewOptions" @update:value="applyView"
+        />
+        <n-button size="small" quaternary @click="openSaveView">存为视图</n-button>
+        <n-button v-if="activeView" size="small" quaternary type="error" @click="removeView">
+          删视图
+        </n-button>
+      </template>
+    </biz-filter-bar>
     <div class="muted" style="margin-bottom: 10px">
       勾选行后可批量删除或按列复制；未勾选时「复制表格」导出当前筛选后的全部行（TSV，可直接粘贴到 Excel）。
     </div>
@@ -533,7 +689,7 @@ const columns = computed<DataTableColumns>(() => {
       :row-key="(row: any) => row.id"
       :columns="columns" :data="filteredRows" :loading="loading"
       :row-props="rowProps"
-      :bordered="false" size="small" :scroll-x="1212"
+      :bordered="false" size="small" :scroll-x="1344"
       :pagination="paginationProps"
     >
       <template #empty>
@@ -556,6 +712,12 @@ const columns = computed<DataTableColumns>(() => {
     :title="(editingId ? '编辑' : '新增') + title"
     style="width: 780px; max-width: 94vw; max-height: 88vh; overflow: auto"
   >
+    <div class="form-row">
+      <label class="form-label">标签</label>
+      <div class="grow">
+        <n-dynamic-tags v-model:value="formTags" :max="10" />
+      </div>
+    </div>
     <div v-for="f in visibleFields" :key="f.key" class="form-row">
       <label class="form-label">
         {{ f.label }}<span v-if="isRequired(f.key)" class="req" title="必填">*</span>
@@ -571,6 +733,22 @@ const columns = computed<DataTableColumns>(() => {
       <div class="row" style="justify-content: flex-end">
         <n-button @click="showModal = false">取消</n-button>
         <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+      </div>
+    </template>
+  </n-modal>
+
+  <n-modal v-model:show="showViewModal" preset="card" title="存为视图" style="width: 380px">
+    <n-input
+      v-model:value="viewName" placeholder="例如：我的 BUG"
+      maxlength="40" show-count @keyup.enter="commitView"
+    />
+    <div class="muted" style="margin-top: 8px">
+      保存的是当前筛选条件，不是结果；下次打开会按当时的数据重算。
+    </div>
+    <template #footer>
+      <div class="row" style="justify-content: flex-end">
+        <n-button @click="showViewModal = false">取消</n-button>
+        <n-button type="primary" @click="commitView">保存</n-button>
       </div>
     </template>
   </n-modal>
@@ -591,4 +769,10 @@ const columns = computed<DataTableColumns>(() => {
   border-radius: var(--r-xs); cursor: pointer; opacity: 0;
 }
 :deep(.n-data-table-tr:hover .cell-copy), :deep(.cell-copy:focus-visible) { opacity: 1; }
+:deep(.tag-cell) { display: flex; gap: 4px; overflow: hidden; }
+:deep(.tag-chip) {
+  font-size: 11px; line-height: 16px; padding: 0 5px; white-space: nowrap;
+  color: var(--ink-2); background: var(--paper-2); border-radius: var(--r-xs);
+}
+:deep(.tag-more) { font-size: 11px; color: var(--ink-3); }
 </style>

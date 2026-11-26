@@ -17,6 +17,7 @@ import webbrowser
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from . import totp
 from .db import connect, decrypt, encrypt
 
 log = logging.getLogger("onlyone")
@@ -34,6 +35,8 @@ class CredentialIn(BaseModel):
     project_id: int | None = None
     # 绑定的 SAP 连接标识（如 "QS4|100"），明文存储，非敏感
     sap_conn: str | None = None
+    # 两步验证密钥（Base32）。留空表示不修改；空串表示解绑。
+    totp: str | None = None
 
 
 def _row(conn, cid: int):
@@ -48,6 +51,17 @@ def _public(row) -> dict:
     """
     out = {k: row[k] for k in ("id", "title", "project_id", "updated_at")}
     out["sap_conn"] = row["sap_conn"] or ""
+    # 动态码：只返回算好的 6 位与剩余秒数，密钥不出接口（前端也不需要）
+    out["has_totp"] = bool(row["totp_enc"])
+    out["totp_code"] = ""
+    out["totp_remaining"] = 0
+    if row["totp_enc"]:
+        try:
+            secret = decrypt(row["totp_enc"])
+            out["totp_code"] = totp.code_at(secret)
+            out["totp_remaining"] = totp.remaining()
+        except Exception:  # noqa: BLE001 - 解密失败按未绑定展示
+            log.warning("凭据 id=%s TOTP 密钥不可用", row["id"])
     for field in ENC_FIELDS:
         blob = row[field + "_enc"]
         has = bool(blob)
@@ -123,15 +137,26 @@ def open_credential_url(cid: int):
 def create_credential(body: CredentialIn):
     if not (body.title or "").strip():
         raise HTTPException(400, "标题不能为空")
+    # 注意区分「没填」和「填了但非法」：normalize 会把中文/符号全部滤掉，
+    # 若不先看原始输入，用户把乱码粘进来会被静默当成「未绑定」。
+    totp_raw = str(body.totp or "").strip()
+    totp_secret = totp.normalize_secret(totp_raw)
+    if totp_raw and not totp_secret:
+        raise HTTPException(400, "动态码密钥不是合法的 Base32")
+    if totp_secret and not totp.is_valid_secret(totp_secret):
+        raise HTTPException(400, "动态码密钥不是合法的 Base32")
     conn = connect()
     try:
         cid = conn.execute(
             """INSERT INTO credentials
-               (title,username_enc,password_enc,url_enc,note_enc,project_id,sap_conn,updated_at)
-               VALUES(?,?,?,?,?,?,?,datetime('now','localtime'))""",
+               (title,username_enc,password_enc,url_enc,note_enc,totp_enc,
+                project_id,sap_conn,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,datetime('now','localtime'))""",
             (body.title.strip(),
              encrypt(body.username or ""), encrypt(body.password or ""),
              encrypt(body.url or ""), encrypt(body.note or ""),
+             # 空密钥写 NULL：否则 encrypt("") 也是非空 BLOB，会被当成「已绑定」
+             encrypt(totp_secret) if totp_secret else None,
              body.project_id, (body.sap_conn or "").strip()),
         ).lastrowid
         conn.commit()
@@ -166,6 +191,15 @@ def update_credential(cid: int, body: CredentialIn):
             if field in data:
                 sets.append(field + "_enc=?")
                 params.append(encrypt(data[field] or ""))
+        if "totp" in data:
+            original = str(data["totp"] or "").strip()
+            raw = totp.normalize_secret(original)
+            if original and not raw:
+                raise HTTPException(400, "动态码密钥不是合法的 Base32")
+            if raw and not totp.is_valid_secret(raw):
+                raise HTTPException(400, "动态码密钥不是合法的 Base32")
+            sets.append("totp_enc=?")
+            params.append(encrypt(raw) if raw else None)
         if sets:
             sets.append("updated_at=datetime('now','localtime')")
             conn.execute("UPDATE credentials SET " + ", ".join(sets) + " WHERE id=?",

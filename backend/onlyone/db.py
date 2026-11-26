@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS entries (
   project_id INTEGER,
   occurred_at TEXT,
   tags TEXT NOT NULL DEFAULT '',
+  user_tags TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS credentials (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   username_enc BLOB, password_enc BLOB, url_enc BLOB, note_enc BLOB,
+  totp_enc BLOB,
   project_id INTEGER,
   sap_conn TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -198,6 +200,17 @@ def init_db() -> None:
             conn.execute("ALTER TABLE notes ADD COLUMN project_id INTEGER")
             log.info("notes 表已补 project_id 列")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id)")
+        # 用户标签（2026-11-25）：与 tags（类型标记）分列，避免把业务类型当成用户标签。
+        # 存 JSON 数组字符串，用 json_each 聚合；老库补列时历史行统一为 '[]'。
+        entry_cols = {r["name"] for r in conn.execute("PRAGMA table_info(entries)")}
+        if entry_cols and "user_tags" not in entry_cols:
+            conn.execute("ALTER TABLE entries ADD COLUMN user_tags TEXT NOT NULL DEFAULT '[]'")
+            log.info("entries 表已补 user_tags 列")
+        # 凭据动态码（2026-11-25）：密钥与密码同用 DPAPI；老库补列，历史行为 NULL。
+        cred_cols = {r["name"] for r in conn.execute("PRAGMA table_info(credentials)")}
+        if cred_cols and "totp_enc" not in cred_cols:
+            conn.execute("ALTER TABLE credentials ADD COLUMN totp_enc BLOB")
+            log.info("credentials 表已补 totp_enc 列")
         # 运维记录增加提出人 / 公司 / 类型；老库补列，历史行取空串
         # （类型空值在界面上显示「—」，不强行回填，避免篡改历史记录语义）。
         incident_cols = {r["name"] for r in conn.execute("PRAGMA table_info(incidents)")}

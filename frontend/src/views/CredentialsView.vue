@@ -26,6 +26,10 @@ interface Credential {
   has_url: boolean
   has_note: boolean
   sap_conn: string
+  /** 动态码：只有算好的 6 位与剩余秒数，密钥不下发前端 */
+  has_totp: boolean
+  totp_code: string
+  totp_remaining: number
 }
 interface Project { id: number; name: string }
 interface SapSystem { key: string; label: string; sid: string; client: string; name: string }
@@ -158,7 +162,14 @@ async function load() {
   }
   void loadSapConfig()
 }
-onMounted(load)
+let totpTimer: number | undefined
+onMounted(() => {
+  load()
+  // 动态码 30 秒一变。只在确实有绑定时刷新，没绑定就不白打库。
+  totpTimer = window.setInterval(() => {
+    if (rows.value.some(r => r.has_totp)) void load()
+  }, 30000)
+})
 
 function resetForm() {
   Object.keys(form).forEach(k => delete form[k])
@@ -207,6 +218,8 @@ function openEdit(row: Credential) {
   for (const f of ENC_FIELDS) {
     form[f.key] = f.key === 'password' ? '' : (row[f.key as keyof Credential] ?? '')
   }
+  // TOTP 密钥同样不回填：留空 = 不修改，输入新值 = 覆盖，点「清除」= 解绑
+  form.totp = ''
   showModal.value = true
 }
 
@@ -231,6 +244,9 @@ async function save() {
     else if (editingId.value === null) data[f.key] = form[f.key] || ''
     else if (form[f.key]) data[f.key] = form[f.key]
   }
+  if (cleared.value.includes('totp')) data.totp = ''
+  else if (form.totp) data.totp = String(form.totp).trim()
+  else if (editingId.value === null) data.totp = ''
   saving.value = true
   try {
     const path = '/api/credentials' + (editingId.value ? '/' + editingId.value : '')
@@ -418,6 +434,17 @@ function scheduleClear(value: string) {
   }, 30000)
 }
 
+/** 动态码复制：走同一套剪贴板与审计约束，但不需要 30 秒后清空（码本身就会过期） */
+async function copyText(text: string) {
+  if (!text) return
+  try {
+    await writeClipboard(text)
+    message.success('已复制动态码')
+  } catch {
+    message.error('复制失败')
+  }
+}
+
 async function copyField(row: Credential, field: string, silent = false): Promise<boolean> {
   // 列表已返回明文，无需再走 reveal 接口
   const value = String(row[field as keyof Credential] ?? '')
@@ -439,6 +466,21 @@ async function copyField(row: Credential, field: string, silent = false): Promis
 const columns = computed<DataTableColumns>(() => {
   const cols: DataTableColumns = [
     { title: '标题', key: 'title', width: 160, ellipsis: { tooltip: true } },
+    // 动态码紧跟标题：表格列多，放最右会被挤出可视区，固定右侧又会挤压相邻列
+    {
+      title: '动态码', key: 'totp_code', width: 100,
+      render: (row: any) => {
+        if (!row.has_totp) return h('span', { class: 'cell-value' }, '—')
+        return h('span', {
+          class: 'totp-code',
+          title: `点击复制，${row.totp_remaining || 0} 秒后刷新`,
+          onClick: (e: MouseEvent) => {
+            e.stopPropagation()
+            void copyText(String(row.totp_code || ''))
+          },
+        }, String(row.totp_code || '------'))
+      },
+    },
   ]
   for (const f of ENC_FIELDS) {
     cols.push({
@@ -557,6 +599,7 @@ async function importCredentials() {
 }
 
 onUnmounted(() => {
+  if (totpTimer) window.clearInterval(totpTimer)
   // 离开页签时立即清空，避免明文停留在剪贴板
   if (clearTimer) {
     window.clearTimeout(clearTimer)
@@ -632,7 +675,7 @@ onUnmounted(() => {
     </div>
     <n-data-table
       :columns="columns" :data="rows" :loading="loading" :row-props="rowProps"
-      :bordered="false" size="small" :scroll-x="1220"
+      :bordered="false" size="small" :scroll-x="1400"
       :pagination="rows.length ? {
         pageSize: 10, showSizePicker: true, pageSizes: [10, 20, 50],
         prefix: ({ itemCount }: { itemCount: number | undefined }) => `共 ${itemCount ?? 0} 条`,
@@ -676,6 +719,20 @@ onUnmounted(() => {
         @click="toggleClear(f.key)"
       >
         {{ cleared.includes(f.key) ? '已标记清空' : '清空' }}
+      </n-button>
+    </div>
+    <div class="form-row">
+      <label class="form-label">动态码密钥</label>
+      <n-input
+        v-model:value="form.totp"
+        :placeholder="editingId ? '留空 = 不修改（Base32）' : '可选：Base32 密钥'"
+      />
+      <n-button
+        v-if="editingId" size="tiny" quaternary
+        :type="cleared.includes('totp') ? 'error' : 'default'"
+        @click="toggleClear('totp')"
+      >
+        {{ cleared.includes('totp') ? '已标记清空' : '清空' }}
       </n-button>
     </div>
     <div class="form-row">
@@ -751,6 +808,12 @@ onUnmounted(() => {
   font-size: 12px; color: var(--info-deep); cursor: pointer; text-decoration: underline;
 }
 :deep(.row-selected td) { background: var(--accent-soft) !important; }
+:deep(.totp-code) {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 13px; letter-spacing: 1px; color: var(--ink); cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+:deep(.totp-code:hover) { color: var(--accent-strong); text-decoration: underline; }
 .sap-line { display: flex; align-items: center; gap: 8px; }
 .sap-key { width: 104px; flex-shrink: 0; font-size: 12px; color: var(--ink-2); }
 .sap-line > :deep(.n-input) { flex: 1; min-width: 0; }

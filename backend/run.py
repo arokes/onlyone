@@ -33,7 +33,7 @@ if getattr(sys, "frozen", False):
     os.environ.setdefault("ONLYONE_BASE_DIR", str(Path(sys.executable).resolve().parent))
 
 import uvicorn  # noqa: E402
-from onlyone import desktop  # noqa: E402
+from onlyone import desktop, hotkey  # noqa: E402
 from onlyone.app import TOKEN_ENV, create_app  # noqa: E402
 from onlyone.db import DATA_DIR  # noqa: E402
 
@@ -87,17 +87,63 @@ def _wait_ready(base: str, timeout: float = 30.0) -> bool:
     return False
 
 
+_instance_mutex = None
+
+
+def _acquire_single_instance(mutex_name: str = "OnlyOne-SingleInstance") -> bool:
+    """命名互斥量检测单实例。
+
+    Windows 上同时跑两个 OnlyOne 不只是热键打架：两个进程共用一个 SQLite 库、
+    各跑一个 watcher，会重复扫描并抢写锁（用户 2026-11-25 实际踩到 1409 才发现）。
+    返回 False 表示已有实例——此时把它的窗口置前，本进程应当退出。
+    """
+    global _instance_mutex
+    try:
+        import win32api
+        import win32event
+        import winerror
+    except Exception:  # noqa: BLE001 - 没有 pywin32 时不做限制
+        return True
+    try:
+        # 必须先清零：pywin32 的成功调用不会重置 last error，
+        # 直接读可能拿到上一个操作残留的 183，把「没有实例」误判成「已有实例」。
+        win32api.SetLastError(0)
+        _instance_mutex = win32event.CreateMutex(None, False, "Local\\" + mutex_name)
+        if win32api.GetLastError() != winerror.ERROR_ALREADY_EXISTS:
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+
+    try:
+        import win32con
+        import win32gui
+        hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
+        if hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="OnlyOne 个人工作台")
     ap.add_argument("--no-window", action="store_true", help="只起 API，不开窗口")
     ap.add_argument("--browser", action="store_true", help="用系统默认浏览器打开")
     ap.add_argument("--port", type=int, default=0, help="指定端口，0=随机空闲端口")
+    ap.add_argument("--allow-multi", action="store_true",
+                    help="允许多开（开发调试用；默认检测到已有实例会切过去并退出）")
     ap.add_argument("--no-watcher", action="store_true",
                     help="禁用文件监听与启动全量校准（低干扰模式，默认行为不变）")
     args = ap.parse_args()
 
     setup_logging()
     log = logging.getLogger("onlyone")
+    if not args.no_window and not args.browser and not args.allow_multi:
+        if not _acquire_single_instance():
+            log.info("检测到已有 OnlyOne 在运行，已切换到现有窗口并退出本实例")
+            _say("OnlyOne 已在运行，已切换到现有窗口")
+            return
     token = os.environ.get(TOKEN_ENV) or secrets.token_urlsafe(24)
     os.environ[TOKEN_ENV] = token
     port = _free_port(args.port)
@@ -190,13 +236,38 @@ def main() -> None:
 
                 desktop.set_save_dialog(_save_dialog)
 
+                # 独立捕获小窗：无边框、置顶、默认隐藏。热键只 show 它，主窗口不参与
+                # ——上一版把主窗口缩小，结果最小化状态下热键会把主界面拽出来（用户反馈）。
+                capture_window = None
+                try:
+                    capture_window = webview.create_window(
+                        "OnlyOne 快速捕获", url + "&capture=1",
+                        width=620, height=272, frameless=True, easy_drag=True,
+                        on_top=True, hidden=True, resizable=False,
+                    )
+                    desktop.set_capture_window(capture_window)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("创建捕获小窗失败，退回主窗口变形方案：%s", exc)
+
                 def _on_closing(*_args) -> None:
+                    # 小窗是独立顶层窗口：不先销毁它，webview.start() 不会返回，
+                    # 表现成"关窗后卡 8 秒再被强杀"（2026-11-26 日志里出现过）。
+                    try:
+                        if capture_window is not None:
+                            capture_window.destroy()
+                    except Exception:  # noqa: BLE001
+                        pass
                     server.should_exit = True
                     watchdog = threading.Timer(8.0, _force_exit_if_stuck)
                     watchdog.daemon = True
                     watchdog.start()
 
                 window.events.closing += _on_closing
+
+                # 热键只弹独立小窗。用户明确不要「把主窗口缩成卡片」的降级形态：
+                # 小窗不可用时宁可不响应，也不去动主窗口（2026-11-26）。
+                desktop.set_window_title(WINDOW_TITLE)
+                hotkey.start(desktop.show_capture)
                 webview.start()
             except Exception as exc:  # noqa: BLE001
                 log.warning("桌面窗口不可用，改用系统浏览器：%s", exc)

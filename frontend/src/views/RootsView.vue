@@ -81,6 +81,58 @@ function fmtElapsed(seconds: number): string {
   return s < 60 ? `${s} 秒` : `${Math.floor(s / 60)} 分 ${s % 60} 秒`
 }
 
+// ---------------------------------------------------------------- 重复文件
+interface DupPath { rel_path: string; abs_path: string; mtime: number }
+interface DupGroup {
+  sha256: string; size: number; count: number; wasted: number; paths: DupPath[]
+}
+interface Duplicates {
+  totals: {
+    total_files: number; hashed_files: number; unhashed_files: number
+    groups: number; redundant_files: number; wasted_bytes: number
+  }
+  groups: DupGroup[]
+}
+const dup = ref<Duplicates | null>(null)
+const dupLoading = ref(false)
+
+function fmtBytes(bytes: number): string {
+  if (!bytes) return '0 B'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(0)} KB`
+  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`
+  return `${(bytes / 1073741824).toFixed(2)} GB`
+}
+
+/** 懒加载：重复检查要扫一遍 files 表，进页面不自动跑 */
+async function loadDuplicates() {
+  dupLoading.value = true
+  try {
+    dup.value = await api<Duplicates>('/api/duplicates?limit=50')
+  } catch (e) {
+    message.error(String(e))
+  } finally {
+    dupLoading.value = false
+  }
+}
+
+async function revealPath(path: string) {
+  try {
+    await api('/api/open', { method: 'POST', body: JSON.stringify({ path, reveal: true }) })
+  } catch (e) {
+    message.error(String(e))
+  }
+}
+
+async function copyPath(path: string) {
+  try {
+    await navigator.clipboard.writeText(path)
+    message.success('已复制路径')
+  } catch {
+    message.error('复制失败')
+  }
+}
+
 function startPolling() {
   if (pollTimer) return
   pollTimer = window.setInterval(pollOnce, 800)
@@ -450,6 +502,62 @@ onUnmounted(() => {
       失败会自动重试，累计 {{ MAX_ATTEMPTS }} 次后停止自动重试并留在清单中，可点「重新抽取」手动重置次数。
     </div>
   </div>
+
+  <div class="card" style="margin-top: 14px">
+    <div class="row" style="margin-bottom: 8px">
+      <h3 class="section-title">重复文件</h3>
+      <span class="count-chip">{{ dup?.totals.groups ?? '—' }}</span>
+      <div class="grow" />
+      <n-button size="tiny" quaternary :loading="dupLoading" @click="loadDuplicates">
+        {{ dup ? '重新检查' : '检查重复' }}
+      </n-button>
+    </div>
+
+    <div v-if="!dup" class="muted">
+      按文件内容哈希比对，只报告不删除。仅 ≤50 MB 的文件在扫描时计算了哈希，
+      更大的文件不参与比对（数量会在下面如实显示）。
+    </div>
+
+    <template v-else>
+      <div class="dup-strip">
+        <div class="dup-tile">
+          <div class="dup-label">重复组</div>
+          <div class="dup-value">{{ dup.totals.groups }}</div>
+        </div>
+        <div class="dup-tile">
+          <div class="dup-label">冗余文件</div>
+          <div class="dup-value">{{ dup.totals.redundant_files }}</div>
+        </div>
+        <div class="dup-tile">
+          <div class="dup-label">可释放</div>
+          <div class="dup-value">{{ fmtBytes(dup.totals.wasted_bytes) }}</div>
+        </div>
+        <div class="dup-tile">
+          <div class="dup-label">参与比对</div>
+          <div class="dup-value">{{ dup.totals.hashed_files }}</div>
+        </div>
+      </div>
+
+      <div v-if="!dup.groups.length" class="muted">没有发现重复文件。</div>
+
+      <div v-for="g in dup.groups" :key="g.sha256" class="dup-group">
+        <div class="dup-head">
+          <code>{{ g.sha256.slice(0, 8) }}</code>
+          <span>{{ g.count }} 份 · 每份 {{ fmtBytes(g.size) }}</span>
+          <span class="dup-waste">可释放 {{ fmtBytes(g.wasted) }}</span>
+        </div>
+        <div v-for="p in g.paths" :key="p.abs_path" class="dup-path">
+          <span class="dup-name" :title="p.abs_path">{{ p.rel_path }}</span>
+          <span class="dup-act" @click="revealPath(p.abs_path)">定位</span>
+          <span class="dup-act" @click="copyPath(p.abs_path)">复制路径</span>
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top: 8px">
+        可释放 = 每组保留一份后能省下的空间。这里不提供一键删除，避免误删只存在于索引里的旧路径。
+      </div>
+    </template>
+  </div>
 </template>
 
 <style scoped>
@@ -466,4 +574,19 @@ onUnmounted(() => {
   color: var(--accent-strong);
   letter-spacing: 0.04em;
 }
+.dup-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.dup-tile {
+  flex: 1 1 110px; padding: 8px 10px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.dup-label { font-size: 12px; color: var(--ink-3); }
+.dup-value { font-size: 18px; font-weight: 500; color: var(--ink); font-variant-numeric: tabular-nums; }
+.dup-group { padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+.dup-group:last-child { border-bottom: none; }
+.dup-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--ink-2); }
+.dup-head code { font-size: 11px; color: var(--ink-3); }
+.dup-waste { margin-left: auto; color: var(--warn); }
+.dup-path { display: flex; align-items: center; gap: 8px; padding: 3px 0 3px 10px; font-size: 12px; color: var(--ink-2); }
+.dup-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dup-act { flex: 0 0 auto; color: var(--info-deep); cursor: pointer; text-decoration: underline; }
 </style>

@@ -99,6 +99,10 @@ const search = useSearchStore()
 const { q, items, semanticItems, pluginItems, mode, searched } = storeToRefs(search)
 const busy = ref(false)
 
+/** 标签过滤（2026-11-25）：与关键词可组合，也可单独使用 */
+const activeTag = ref('')
+const tagOptions = ref<{ tag: string; count: number }[]>([])
+
 const showPreview = ref(false)
 const preview = ref<Preview | null>(null)
 const previewBusy = ref(false)
@@ -295,22 +299,41 @@ const allGroups = computed<Group[]>(() => {
 })
 
 async function run() {
-  if (!q.value.trim()) {
+  const keyword = q.value.trim()
+  if (!keyword && !activeTag.value) {
     search.clear()
     return
   }
   busy.value = true
   searched.value = true
   try {
-    const r = await api<SearchResult>(
-      '/api/search?q=' + encodeURIComponent(q.value.trim()),
-    )
+    const params = new URLSearchParams()
+    if (keyword) params.set('q', keyword)
+    if (activeTag.value) params.set('tag', activeTag.value)
+    const r = await api<SearchResult>('/api/search?' + params.toString())
     search.setResult(r)
   } catch (e) {
     message.error(String(e))
   } finally {
     busy.value = false
   }
+}
+
+async function loadTags() {
+  try {
+    tagOptions.value = await api<{ tag: string; count: number }[]>('/api/tags')
+  } catch {
+    // 标签读不出来不影响检索
+  }
+}
+
+function pickTag(tag: string) {
+  activeTag.value = tag
+  if (!tag && !q.value.trim()) {
+    search.clear()
+    return
+  }
+  run()
 }
 
 async function openByPath(path: string | null, reveal: boolean) {
@@ -499,23 +522,22 @@ watch(() => jump.pendingQuery, (val) => {
   if (!val) return
   const query = jump.consumeQuery()
   if (query) {
+    // 外部跳转带来的是明确的关键词，清掉上一次的标签过滤，避免两个条件叠加出空结果
+    activeTag.value = ''
     q.value = query
     run()
   }
 }, { immediate: true })
 
-/** 空状态主操作：搜过就清空回初始态，没搜过就带用户去建索引 */
+/** 空状态主操作：只有「搜过但没结果」时才渲染按钮 —— 清空关键词回到初始态。
+ *  没有索引目录的情况交给首启向导处理，这里不再放「去添加索引目录」，避免误导。 */
 function onEmptyAction() {
-  if (searched.value) {
-    q.value = ''
-    items.value = []
-    semanticItems.value = []
-    pluginItems.value = []
-    searched.value = false
-    focusSearch()
-    return
-  }
-  jump.activeTab = 'roots'
+  q.value = ''
+  items.value = []
+  semanticItems.value = []
+  pluginItems.value = []
+  searched.value = false
+  focusSearch()
 }
 
 onMounted(() => {
@@ -523,6 +545,7 @@ onMounted(() => {
   window.addEventListener('onlyone:focus-search', focusSearch)
   window.addEventListener('resize', onViewportResize)
   loadProjects()
+  loadTags()
   // 跨重启只留关键词：有词且本次会话尚未检索过时，自动重跑一次。
   // URL 深链接 ?q= 走 pendingQuery 的 immediate watch，会先把 searched 置真，避免重复请求。
   if (q.value.trim() && !searched.value) void run()
@@ -543,6 +566,15 @@ onUnmounted(() => {
       />
       <n-button type="primary" :loading="busy" @click="run">搜索</n-button>
     </div>
+    <div v-if="tagOptions.length" class="tag-bar">
+      <span class="tag-bar-label">标签</span>
+      <span class="tag-pill" :class="{ active: !activeTag }" @click="pickTag('')">全部</span>
+      <span v-for="t in tagOptions.slice(0, 12)" :key="t.tag" class="tag-pill"
+            :class="{ active: activeTag === t.tag }" @click="pickTag(t.tag)">
+        {{ t.tag }}<span class="tag-pill-count">{{ t.count }}</span>
+      </span>
+      <span v-if="activeTag" class="tag-bar-clear" @click="pickTag('')">清除标签</span>
+    </div>
     <div v-if="searched" class="result-bar">
       <span class="metric"><b>{{ items.length }}</b> 字面命中</span>
       <span class="metric"><b>{{ semanticItems.length }}</b> 语义相近</span>
@@ -553,12 +585,12 @@ onUnmounted(() => {
 
   <div v-if="!allGroups.length" class="card" style="margin-top: 14px">
     <empty-state
-      :title="searched ? `没找到与「${q.trim()}」匹配的内容` : '还没有可搜索的内容'"
+      :title="searched ? `没找到与「${q.trim()}」匹配的内容` : '输入关键词开始搜索'"
       :desc="searched
         ? '试试更短的词或只保留关键词；两个字以内的短词会自动退回字面匹配，命中率更高。'
-        : '添加一个索引目录并扫描，或先录入项目 / 日志 / 运维记录，之后就能在这里统一搜索。'"
-      :action-text="searched ? '清空关键词' : '去添加索引目录'"
-      :hint="searched ? '或按 Ctrl+K 重新聚焦搜索框' : '扫描完成后结果会自动出现'"
+        : '可搜索文件正文与标题，以及项目、运维记录、企微链接与记事本；多个词用空格分隔即可。'"
+      :action-text="searched ? '清空关键词' : ''"
+      :hint="searched ? '或按 Ctrl+K 重新聚焦搜索框' : '按 Ctrl+K 可随时聚焦搜索框'"
       @action="onEmptyAction"
     />
   </div>
@@ -902,6 +934,22 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.tag-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin-top: 10px; padding: 6px 2px;
+}
+.tag-bar-label { font-size: 11px; color: var(--ink-3); margin-right: 2px; }
+.tag-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; line-height: 20px; padding: 0 8px;
+  color: var(--ink-2); background: var(--paper-2);
+  border: 1px solid transparent; border-radius: 999px; cursor: pointer;
+}
+.tag-pill:hover { border-color: var(--line); }
+.tag-pill.active { color: var(--accent-strong); background: var(--accent-soft); }
+.tag-pill-count { font-size: 11px; color: var(--ink-3); }
+.tag-pill.active .tag-pill-count { color: var(--accent-strong); }
+.tag-bar-clear { font-size: 11px; color: var(--info-deep); cursor: pointer; text-decoration: underline; }
 .result-bar {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line-soft);
