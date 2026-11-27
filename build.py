@@ -2,14 +2,21 @@
 """M5-4 打包：npm run build → PyInstaller onedir → 复制前端产物到 EXE 同级。
 
 用法：py -3 build.py [--skip-frontend] [--skip-pyinstaller] [--dist-dir dist_next]
+                 [--bump none|patch|minor|major] [--set-version 0.2.0]
 交付是**文件夹** ``dist/OnlyOne/``，不是单 EXE；把整个文件夹拷走即可离线运行。
 运行时数据目录 ``data/`` 与前端 ``frontend/dist/`` 都在 OnlyOne.exe 同级，
 由 backend/run.py 的 ONLYONE_BASE_DIR 与 db.py 的 _base_dir() 定位。
+
+版本号：唯一真值是 ``backend/onlyone/__init__.py`` 的 ``__version__``。
+不加参数＝**不升级**，按当前版本打包；``--bump`` 按语义位升级，``--set-version`` 直接指定。
+升级结果同时写回 ``frontend/package.json``，并生成 ``build/version_info.txt``
+经 PyInstaller ``--version-file`` 注入 EXE 属性（文件版本 / 产品版本）。
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +28,97 @@ ROOT = Path(__file__).resolve().parent
 FRONTEND = ROOT / "frontend"
 ENTRY = ROOT / "backend" / "run.py"
 ICON = ROOT / "assets" / "icon" / "onlyone.ico"
+VERSION_FILE = ROOT / "backend" / "onlyone" / "__init__.py"
+PKG_JSON = FRONTEND / "package.json"
+VERSION_INFO = ROOT / "build" / "version_info.txt"
+
+_VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.M)
+_PKG_VERSION_RE = re.compile(r'^(\s*)"version":\s*"([^"]+)"', re.M)
+
+
+# ---------------------------------------------------------------- 版本管理
+def read_version() -> str:
+    """读当前版本（唯一真值：backend/onlyone/__init__.py）。"""
+    text = VERSION_FILE.read_text(encoding="utf-8")
+    m = _VERSION_RE.search(text)
+    if not m:
+        raise SystemExit("无法在 %s 中定位 __version__" % VERSION_FILE)
+    return m.group(1)
+
+
+def _parse_semver(ver: str) -> tuple[int, int, int]:
+    parts = ver.strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise SystemExit("版本号必须是 X.Y.Z 三段数字：%r" % ver)
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def bump_version(ver: str, level: str) -> str:
+    """按语义位升级：patch 0.1.0→0.1.1 / minor 0.1.0→0.2.0 / major 0.1.0→1.0.0。"""
+    major, minor, patch = _parse_semver(ver)
+    if level == "major":
+        return "%d.0.0" % (major + 1)
+    if level == "minor":
+        return "%d.%d.0" % (major, minor + 1)
+    if level == "patch":
+        return "%d.%d.%d" % (major, minor, patch + 1)
+    return ver
+
+
+def write_version(ver: str) -> None:
+    """把版本写回 __init__.py 与 package.json。
+
+    只替换版本那一行，其余内容原样保留；newline="" 避免把文件里的 LF 统一改成 CRLF。
+    """
+    ctx = {}
+    text = VERSION_FILE.read_text(encoding="utf-8")
+    text = _VERSION_RE.sub('__version__ = "%s"' % ver, text, count=1)
+    VERSION_FILE.write_text(text, encoding="utf-8", newline="")
+
+    if PKG_JSON.exists():
+        pkg = PKG_JSON.read_text(encoding="utf-8")
+        if _PKG_VERSION_RE.search(pkg):
+            pkg = _PKG_VERSION_RE.sub(lambda m: '%s"version": "%s"' % (m.group(1), ver),
+                                      pkg, count=1)
+            PKG_JSON.write_text(pkg, encoding="utf-8", newline="")
+
+
+def write_version_file(ver: str) -> Path:
+    """生成 PyInstaller 的 Windows 版本资源文件（EXE 属性 → 详细信息）。"""
+    major, minor, patch = _parse_semver(ver)
+    quad = "(%d, %d, %d, 0)" % (major, minor, patch)
+    VERSION_INFO.parent.mkdir(parents=True, exist_ok=True)
+    content = """# UTF-8
+# 由 build.py 自动生成，勿手改；版本号真值在 backend/onlyone/__init__.py。
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=%(quad)s,
+    prodvers=%(quad)s,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '080404b0',
+        [StringStruct('CompanyName', 'OnlyOne'),
+         StringStruct('FileDescription', 'OnlyOne 个人工作台'),
+         StringStruct('FileVersion', '%(ver)s'),
+         StringStruct('InternalName', 'OnlyOne'),
+         StringStruct('OriginalFilename', 'OnlyOne.exe'),
+         StringStruct('ProductName', 'OnlyOne'),
+         StringStruct('ProductVersion', '%(ver)s')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
+""" % {"quad": quad, "ver": ver}
+    VERSION_INFO.write_text(content, encoding="utf-8", newline="")
+    return VERSION_INFO
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, shell: bool = False) -> None:
@@ -115,7 +213,39 @@ def main() -> int:
     ap.add_argument("--skip-pyinstaller", action="store_true", help="只重新复制前端产物")
     ap.add_argument("--dist-dir", default="dist",
                     help="产物输出目录（默认 dist）；换目录可保留旧产物，避免整目录删除")
+    ap.add_argument("--bump", choices=["none", "patch", "minor", "major"], default="none",
+                    help="打包前升级版本位（默认 none＝不升级）")
+    ap.add_argument("--set-version", metavar="X.Y.Z", default=None,
+                    help="打包前把版本直接设为指定值（与 --bump 互斥）")
     args = ap.parse_args()
+
+    if args.set_version and args.bump != "none":
+        raise SystemExit("--set-version 与 --bump 只能二选一")
+
+    # 依赖前置校验：放在写版本号之前，避免「版本升了但根本没打成包」
+    if not args.skip_pyinstaller:
+        if not ICON.exists():
+            raise SystemExit("缺少图标：%s\n先运行 python assets/icon/render_icons.py 生成" % ICON)
+        if importlib.util.find_spec("PyInstaller") is None:
+            raise SystemExit("缺少 PyInstaller：py -3 -m pip install pyinstaller")
+
+    old_ver = read_version()
+    if args.set_version:
+        new_ver = args.set_version.strip()
+        _parse_semver(new_ver)  # 提前校验格式，避免写坏源文件
+    elif args.bump != "none":
+        new_ver = bump_version(old_ver, args.bump)
+    else:
+        new_ver = old_ver
+
+    if new_ver != old_ver:
+        write_version(new_ver)
+        print("+ 版本升级：v%s → v%s（%s）" % (old_ver, new_ver, args.bump
+                                          if args.bump != "none" else "set-version"),
+              flush=True)
+    else:
+        print("+ 版本：v%s（不升级）" % new_ver, flush=True)
+    ver_file = write_version_file(new_ver)
 
     dist = (ROOT / args.dist_dir).resolve()
     app_dir = dist / "OnlyOne"
@@ -126,10 +256,6 @@ def main() -> int:
         run(["npm", "run", "build"], cwd=FRONTEND, shell=True)
 
     if not args.skip_pyinstaller:
-        if not ICON.exists():
-            raise SystemExit("缺少图标：%s\n先运行 python assets/icon/render_icons.py 生成" % ICON)
-        if importlib.util.find_spec("PyInstaller") is None:
-            raise SystemExit("缺少 PyInstaller：py -3 -m pip install pyinstaller")
         if app_dir.exists():
             # 旧产物整体改名挪开（不删除），PyInstaller 才不会去 rmtree 它
             old_dir = retire(app_dir)
@@ -143,6 +269,8 @@ def main() -> int:
                 # 只在资源层面生效：已存在的桌面快捷方式仍会显示旧图标（Windows 图标缓存），
                 # 需要重建快捷方式才会刷新。
                 "--icon", str(ICON),
+                # 版本资源：决定 EXE「属性 → 详细信息」里的文件版本 / 产品版本
+                "--version-file", str(ver_file),
                 "--distpath", str(dist),
                 "--workpath", str(ROOT / "build" / "pyi"),
                 "--specpath", str(ROOT / "build"),
@@ -160,6 +288,8 @@ def main() -> int:
             if old_dir is not None and not app_dir.exists():
                 old_dir.rename(app_dir)
                 print("+ 打包失败，已把旧产物还原回 %s" % app_dir, flush=True)
+            if new_ver != old_ver:
+                print("! 版本号已写为 v%s，未回滚（下次打包沿用）" % new_ver, flush=True)
             raise
 
     exe = app_dir / "OnlyOne.exe"
@@ -181,6 +311,7 @@ def main() -> int:
 
     size = sum(p.stat().st_size for p in app_dir.rglob("*") if p.is_file())
     print("OK  EXE      : %s" % exe)
+    print("OK  version  : v%s" % new_ver)
     print("OK  frontend : %s" % out_frontend)
     print("OK  data dir : %s" % (app_dir / "data"))
     print("OK  total    : %.1f MB（文件夹交付，不是单 EXE）" % (size / 1024 / 1024))

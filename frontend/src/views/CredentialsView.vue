@@ -149,6 +149,8 @@ async function load() {
     projects.value = projs
     // 重新拉取后一律回到掩码状态，避免明文在页面上长时间停留
     revealed.value = []
+    totpRetry = 0
+    scheduleTotp()
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -162,13 +164,74 @@ async function load() {
   }
   void loadSapConfig()
 }
+
+/** 动态码计数器：码变化时自增，给表格列的 render 一个明确的刷新依赖。
+ *  NDataTable 的单元格渲染依赖 row 字段本身不一定能稳定触发重绘，加这一层更稳。 */
+const totpVersion = ref(0)
 let totpTimer: number | undefined
+let totpRetry = 0
+
+/** 按 TOTP 时间片对齐排下一次刷新，而不是固定 30 秒轮询。
+ *
+ *  原实现 setInterval 从组件挂载时刻起算，与码的 30 秒绝对边界不同相：
+ *  12 秒进入页签 → 42 秒才刷新，而码在 30 秒已过期，最长有 30 秒在展示废码
+ *  （用户 2026-11-26 反馈「到期不刷新，切页签才更新」就是这个相位差）。
+ *  这里改用后端返回的 remaining 反推过期时刻，再加 350ms 余量越过边界。 */
+function scheduleTotp() {
+  if (totpTimer) {
+    window.clearTimeout(totpTimer)
+    totpTimer = undefined
+  }
+  const remainings = rows.value
+    .filter(r => r.has_totp)
+    .map(r => Number(r.totp_remaining) || 0)
+  if (!remainings.length) return
+  const waitMs = Math.max(1, Math.min(...remainings)) * 1000 + 350
+  totpTimer = window.setTimeout(() => { void refreshTotp() }, waitMs)
+}
+
+/** 只刷新动态码字段：不动项目 / SAP 配置，不置 loading（避免遮罩每 30 秒闪一下），
+ *  也不重置 revealed（用户展开着的密码不会被自动刷新收回掩码）。 */
+async function refreshTotp() {
+  if (!rows.value.some(r => r.has_totp)) return
+  try {
+    const creds = await api<Credential[]>('/api/credentials')
+    const byId = new Map(creds.map(c => [c.id, c]))
+    for (const row of rows.value) {
+      const fresh = byId.get(row.id)
+      if (!fresh) continue
+      row.has_totp = fresh.has_totp
+      row.totp_code = fresh.totp_code
+      row.totp_remaining = fresh.totp_remaining
+    }
+    totpVersion.value++
+    totpRetry = 0
+    scheduleTotp()
+  } catch {
+    // 后端正在重启等瞬时故障：5 秒后重试，最多 3 次，之后等窗口聚焦/切页签再对齐
+    if (totpTimer) window.clearTimeout(totpTimer)
+    if (totpRetry < 3) {
+      totpRetry++
+      totpTimer = window.setTimeout(() => { void refreshTotp() }, 5000)
+    }
+  }
+}
+
+function onPageVisible() {
+  // WebView2 / 浏览器会把后台页面的定时器节流，睡眠唤醒后也可能累积偏差：
+  // 回到前台立即对齐一次，而不是等下一次定时器。
+  if (document.visibilityState !== 'visible') return
+  if (totpTimer) {
+    window.clearTimeout(totpTimer)
+    totpTimer = undefined
+  }
+  if (rows.value.some(r => r.has_totp)) void refreshTotp()
+}
+
 onMounted(() => {
-  load()
-  // 动态码 30 秒一变。只在确实有绑定时刷新，没绑定就不白打库。
-  totpTimer = window.setInterval(() => {
-    if (rows.value.some(r => r.has_totp)) void load()
-  }, 30000)
+  void load()
+  document.addEventListener('visibilitychange', onPageVisible)
+  window.addEventListener('focus', onPageVisible)
 })
 
 function resetForm() {
@@ -470,10 +533,12 @@ const columns = computed<DataTableColumns>(() => {
     {
       title: '动态码', key: 'totp_code', width: 100,
       render: (row: any) => {
+        // 读一次 totpVersion 建立渲染依赖：静默刷新只改 row 字段时也能稳定重绘
+        void totpVersion.value
         if (!row.has_totp) return h('span', { class: 'cell-value' }, '—')
         return h('span', {
           class: 'totp-code',
-          title: `点击复制，${row.totp_remaining || 0} 秒后刷新`,
+          title: '点击复制，每 30 秒自动刷新',
           onClick: (e: MouseEvent) => {
             e.stopPropagation()
             void copyText(String(row.totp_code || ''))
@@ -599,7 +664,9 @@ async function importCredentials() {
 }
 
 onUnmounted(() => {
-  if (totpTimer) window.clearInterval(totpTimer)
+  if (totpTimer) window.clearTimeout(totpTimer)
+  document.removeEventListener('visibilitychange', onPageVisible)
+  window.removeEventListener('focus', onPageVisible)
   // 离开页签时立即清空，避免明文停留在剪贴板
   if (clearTimer) {
     window.clearTimeout(clearTimer)

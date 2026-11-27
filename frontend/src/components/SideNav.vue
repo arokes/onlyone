@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /**
- * 左侧一级导航（v0.8）：替代原顶部页签。
+ * 左侧一级导航：替代原顶部页签。
  * 垂直排布不再需要溢出下拉，按「知识 / 业务 / 系统」分组，底部显示运行形态与版本。
+ * 版本号由 App.vue 从后端 /api/meta/status 取回后传入，本组件不持有版本常量。
  */
 import { computed, onMounted, ref } from 'vue'
 import { api } from '@/api/client'
@@ -31,6 +32,7 @@ onMounted(async () => {
 const GROUP_ORDER = ['知识', '业务', '系统']
 
 const ICONS: Record<string, string[]> = {
+  home: ['M4 10.2 12 3.6l8 6.6V20H4z', 'M9.8 20v-5.4h4.4V20'],
   search: ['M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14Z', 'M16.2 16.2 21 21'],
   notes: ['M6 3h8l4 4v14H6z', 'M14 3v4h4', 'M9 12h6', 'M9 16h6'],
   projects: ['M4 4h6v6H4z', 'M14 4h6v6h-6z', 'M4 14h6v6H4z', 'M14 14h6v6h-6z'],
@@ -40,6 +42,16 @@ const ICONS: Record<string, string[]> = {
     'M15.4 11.6 17.8 9.2a3.4 3.4 0 0 0-4.8-4.8L10.6 6.8'],
   credentials: ['M6 11h12v9H6z', 'M9 11V8a3 3 0 0 1 6 0v3'],
   roots: ['M3 6h6l2 2h10v10.5H3z'],
+}
+
+/**
+ * 兜底：新增页签若漏配图标，渲染一个小圆点占位，而不是留一个空的 16px svg。
+ * 概览项曾因 ICONS 缺 home 整格空白，在 72px 图标栏下尤其像"空选择项"（2026-11-27 反馈）。
+ */
+const FALLBACK_ICON = ['M12 10.4a1.6 1.6 0 1 0 0 3.2 1.6 1.6 0 0 0 0-3.2Z']
+
+function iconPaths(key: string): string[] {
+  return ICONS[key] ?? FALLBACK_ICON
 }
 
 const groups = computed(() => {
@@ -73,7 +85,7 @@ const groups = computed(() => {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
                aria-hidden="true" focusable="false">
-            <path v-for="(d, i) in ICONS[it.key] ?? []" :key="i" :d="d" />
+            <path v-for="(d, i) in iconPaths(it.key)" :key="i" :d="d" />
           </svg>
           <span class="nav-label">{{ it.label }}</span>
         </button>
@@ -82,7 +94,7 @@ const groups = computed(() => {
 
     <div class="footer">
       <div><span class="dot" />本地运行 · 无云端依赖</div>
-      <div>{{ props.version }}</div>
+      <div v-if="props.version">{{ props.version }}</div>
       <div v-if="hotkey" class="hotkey-line" :class="{ warn: !hotkey.enabled }"
            :title="hotkey.enabled ? 'Ctrl+Alt+Space 唤起快速捕获' : (hotkey.error || '热键未注册')">
         {{ hotkey.enabled ? '热键 ' + prettyHotkey : '热键不可用' }}

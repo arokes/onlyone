@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 应用外壳（v0.8 暖纸主题）：左侧一级导航 + 右侧内容区。
+ * 应用外壳（左侧一级导航 + 右侧内容区）。
  * 页签按需挂载；activeTab 放在 Pinia store，供跨页跳转与 ?tab= 深链接复用。
  */
 import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref } from 'vue'
@@ -100,6 +100,9 @@ const { activeTab } = storeToRefs(jump)
 const ready = ref(false)
 const error = ref('')
 const showSetup = ref(false)
+// 版本号唯一来源是后端 __version__（/api/meta/status），前端不再写死；
+// 拿不到时留空，侧栏不显示版本行，避免出现只有 "v" 的残缺文本。
+const appVersion = ref('')
 const current = computed<{ label: string; stage: string }>(() => ({
   label: navItems.find(i => i.key === activeTab.value)?.label ?? '',
   stage: '',
@@ -120,7 +123,9 @@ function onGlobalKey(e: KeyboardEvent) {
 onMounted(async () => {
   window.addEventListener('keydown', onGlobalKey)
   try {
-    const st = await api<{ ok: boolean; counts: { roots: number } }>('/api/meta/status')
+    const st = await api<{ ok: boolean; version: string; counts: { roots: number } }>(
+      '/api/meta/status')
+    appVersion.value = st.version ?? ''
     ready.value = true
     // 没有任何索引根目录且未跳过时才弹向导
     showSetup.value = st.counts.roots === 0
@@ -138,7 +143,7 @@ onUnmounted(() => window.removeEventListener('keydown', onGlobalKey))
       <n-dialog-provider>
         <div v-if="!captureOnly" class="app">
           <side-nav
-            :items="navItems" :active="activeTab" version="v0.8 · 暖纸主题"
+            :items="navItems" :active="activeTab" :version="appVersion ? 'v' + appVersion : ''"
             @update:active="activeTab = $event"
           />
           <main class="content">

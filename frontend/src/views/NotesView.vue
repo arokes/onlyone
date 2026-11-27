@@ -20,6 +20,7 @@ import {
 } from 'naive-ui'
 import { api, TOKEN } from '@/api/client'
 import EmptyState from '@/components/EmptyState.vue'
+import ImageLightbox from '@/components/ImageLightbox.vue'
 import { useJumpStore } from '@/stores/jump'
 import { useViewStateStore } from '@/stores/viewState'
 import {
@@ -126,6 +127,18 @@ const TableWithHeight = Table.extend({
     }
   },
 })
+
+/** 双击图片看原图：正文宽度上限 720px，截图里的细节必须放大才能看清。
+ *  单击保持 TipTap 的选中语义（图片 / 表格节点选中后拖拽或删除），不改默认行为。 */
+const viewerSrc = ref('')
+function onDblClick(e: MouseEvent) {
+  const el = e.target as HTMLElement | null
+  if (!el || el.tagName !== 'IMG') return
+  const src = (el as HTMLImageElement).src
+  if (!src) return
+  e.preventDefault()
+  viewerSrc.value = src
+}
 
 const editor = useEditor({
   extensions: [
@@ -1480,10 +1493,11 @@ onBeforeUnmount(() => {
           <span v-if="imageBusy" class="muted">图片处理中 {{ imageBusy }}</span>
           <div class="grow" />
           <span class="muted">
-            可 Ctrl+V 粘贴图片 / Excel / 网页表格 · 改动后 1 秒自动保存 · revision {{ revision }}
+            可 Ctrl+V 粘贴图片 / Excel / 网页表格 · 双击图片看原图 · 改动后 1 秒自动保存 · revision {{ revision }}
           </span>
         </div>
-        <editor-content :editor="editor" class="tiptap" />
+        <editor-content :editor="editor" class="tiptap" @dblclick="onDblClick" />
+        <image-lightbox v-if="viewerSrc" :src="viewerSrc" @close="viewerSrc = ''" />
 
         <div v-if="links.outlinks.length || links.backlinks.length" class="wiki-panel">
           <div class="wiki-col">

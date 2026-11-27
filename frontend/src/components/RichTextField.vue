@@ -15,6 +15,7 @@ import StarterKit from '@tiptap/starter-kit'
 import TiptapImage from '@tiptap/extension-image'
 import { uploadImageFile } from '@/utils/image'
 import { toEditorContent } from '@/utils/richtext'
+import ImageLightbox from './ImageLightbox.vue'
 
 const props = defineProps<{
   modelValue: unknown
@@ -49,7 +50,19 @@ const editor = useEditor({
 })
 
 const surfaceStyle = computed(() => ({ '--rich-min-h': `${props.minHeight ?? 92}px` }))
-const hint = 'Ctrl+V 贴图 · Ctrl+B 加粗 · Ctrl+I 斜体 · Ctrl+Shift+8 列表'
+const hint = 'Ctrl+V 贴图 · 双击图片看原图 · Ctrl+B 加粗 · Ctrl+I 斜体 · Ctrl+Shift+8 列表'
+
+/** 双击图片看原图。单击保持 TipTap 的「选中节点」语义（拖拽 / Delete 删除），
+ *  弹窗宽 780px、图片被 max-width 压到约 640px，4K 截图里的字必须放大才能看。 */
+const viewerSrc = ref('')
+function onDblClick(e: MouseEvent) {
+  const el = e.target as HTMLElement | null
+  if (!el || el.tagName !== 'IMG') return
+  const src = (el as HTMLImageElement).src
+  if (!src) return
+  e.preventDefault()          // 不要让双击顺带选中正文
+  viewerSrc.value = src
+}
 
 /** 外部值变化（切换到另一条记录 / 表单重置）时同步进编辑器，且不回灌 update 事件。 */
 watch(() => props.modelValue, value => {
@@ -106,7 +119,8 @@ function enqueue(file: File, pos: number) {
 </script>
 
 <template>
-  <div class="rich-field" :class="{ 'is-empty': empty }" :style="surfaceStyle">
+  <div class="rich-field" :class="{ 'is-empty': empty }" :style="surfaceStyle"
+       @dblclick="onDblClick">
     <editor-content :editor="editor" class="rich-surface" />
     <span v-if="empty && placeholder" class="rich-placeholder">{{ placeholder }}</span>
     <div class="rich-foot">
@@ -114,6 +128,7 @@ function enqueue(file: File, pos: number) {
       <span v-else-if="errorText" class="rich-status err">{{ errorText }}</span>
       <span v-else class="rich-hint">{{ hint }}</span>
     </div>
+    <image-lightbox v-if="viewerSrc" :src="viewerSrc" @close="viewerSrc = ''" />
   </div>
 </template>
 

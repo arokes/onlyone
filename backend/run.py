@@ -33,11 +33,13 @@ if getattr(sys, "frozen", False):
     os.environ.setdefault("ONLYONE_BASE_DIR", str(Path(sys.executable).resolve().parent))
 
 import uvicorn  # noqa: E402
-from onlyone import desktop, hotkey  # noqa: E402
+from onlyone import __version__, desktop, hotkey  # noqa: E402
 from onlyone.app import TOKEN_ENV, create_app  # noqa: E402
 from onlyone.db import DATA_DIR  # noqa: E402
 
-WINDOW_TITLE = "OnlyOne - 个人工作台"
+# 标题内带版本号：用户截屏/报障时能直接看出跑的是哪一版。
+# 单实例查找也用这个常量，标题与查找必须同源，否则旧实例会找不到。
+WINDOW_TITLE = "OnlyOne v%s - 个人工作台" % __version__
 
 
 def _say(text: str) -> None:
